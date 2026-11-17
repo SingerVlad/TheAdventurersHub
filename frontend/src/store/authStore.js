@@ -1,18 +1,18 @@
 import { create } from 'zustand';
 
+try {
+  localStorage.removeItem('token');
+} catch {
+  // Storage may be disabled by the browser; authentication does not depend on it.
+}
+
 export const useAuthStore = create((set) => ({
-  token: localStorage.getItem('token') || null,
+  isAuthenticated: false,
   user: null,
-  
-  // Función para guardar el token cuando hacemos login
-  setToken: (token) => {
-    localStorage.setItem('token', token);
-    set({ token });
-  },
-  
-  // Función para cerrar sesión
+
+  setAuthenticated: (isAuthenticated) => set({ isAuthenticated }),
+
   logout: () => {
-    localStorage.removeItem('token');
-    set({ token: null, user: null });
-  }
+    set({ isAuthenticated: false, user: null });
+  },
 }));

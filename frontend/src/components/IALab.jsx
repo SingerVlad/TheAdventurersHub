@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
-import { useAuthStore } from '../store/authStore';
 import { 
   Sparkles, BrainCircuit, Wand2, 
   Trash2, Save, Check, Layout, Image as ImageIcon, Loader2
@@ -17,19 +16,15 @@ export default function IALab() {
   const [campanas, setCampanas] = useState([]);
   const [selectedCampana, setSelectedCampana] = useState('');
   
-  const token = useAuthStore((state) => state.token);
-
   useEffect(() => {
     const fetchCampanas = async () => {
       try {
-        const res = await api.get('/campanas', {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+        const res = await api.get('/campanas');
         setCampanas(res.data.mis_campanas);
       } catch (err) { console.error(err); }
     };
     fetchCampanas();
-  }, [token]);
+  }, []);
 
   const generarNPC = async (e) => {
     e.preventDefault();
@@ -40,9 +35,7 @@ export default function IALab() {
     setIsSaved(false);
 
     try {
-      const res = await api.post('/ia/npc-rapido', { idea }, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await api.post('/ia/npc-rapido', { idea });
       setResult(res.data.resultado);
     } catch (err) {
       alert("Error: " + (err.response?.data?.error || err.message));
@@ -57,9 +50,7 @@ export default function IALab() {
       // Creamos un prompt descriptivo basado en el NPC generado
       const visualPrompt = `Portrait of ${result.nombre}, a ${result.raza} ${result.clase}. ${result.personalidad}`;
       
-      const res = await api.post('/ia/generar-imagen', { prompt: visualPrompt }, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await api.post('/ia/generar-imagen', { prompt: visualPrompt });
       
       setImagePreview(res.data.image_b64);
     } catch (err) {
@@ -74,21 +65,17 @@ export default function IALab() {
       tipo: 'NPC',
       contenido: result,
       campana_id: selectedCampana || null
-    }, { headers: { Authorization: `Bearer ${token}` } });
+    });
 
     // 2. Guardar la imagen (AQUÍ ESTÁ EL CAMBIO)
     if (imagePreview) {
-      const campanaObj = campanas.find(c => c.id === selectedCampana);
-      const campanaNombre = campanaObj ? campanaObj.nombre : "General";
-
       await api.post('/assets/guardar-imagen', {
         image_b64: imagePreview,
         nombre_npc: result.nombre,
-        campana_nombre: campanaNombre,
         prompt_usado: result.personalidad,
         // --- ENVIAMOS EL ID PARA QUE APAREZCA EN LA AVENTURA ---
         campana_id: selectedCampana || null 
-      }, { headers: { Authorization: `Bearer ${token}` } });
+      });
     }
     
     setIsSaved(true);
@@ -208,4 +195,4 @@ export default function IALab() {
       )}
     </div>
   );
-} 
+}

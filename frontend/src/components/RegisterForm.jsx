@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import axios from 'axios';
 import { User, Lock, ShieldAlert, UserPlus } from 'lucide-react';
 import {api} from '../api';
 
@@ -21,13 +20,13 @@ export default function RegisterForm({ onBackToLogin }) {
 
     try {
       await api.post('/registro', {
-        username,
+        username: username.trim(),
         password
       });
       alert("¡Cuenta creada con éxito! Ahora puedes identificarte.");
       onBackToLogin(); // Volvemos al login automáticamente
     } catch (err) {
-      setError(err.response?.data?.error || 'Error al registrar al nuevo héroe' + err);
+      setError(err.response?.data?.error || 'No se pudo crear la cuenta. Intenta más tarde.');
     } finally {
       setLoading(false);
     }
@@ -51,6 +50,10 @@ export default function RegisterForm({ onBackToLogin }) {
           <input 
             required
             type="text" 
+            minLength={3}
+            maxLength={32}
+            pattern="[A-Za-z0-9_-]+"
+            autoComplete="username"
             placeholder="Nombre de usuario"
             className="w-full bg-black border border-fantasy-wood p-2 pl-10 rounded text-fantasy-paper focus:outline-none focus:border-fantasy-gold"
             value={username}
@@ -63,6 +66,9 @@ export default function RegisterForm({ onBackToLogin }) {
           <input 
             required
             type="password" 
+            minLength={12}
+            maxLength={128}
+            autoComplete="new-password"
             placeholder="Contraseña"
             className="w-full bg-black border border-fantasy-wood p-2 pl-10 rounded text-fantasy-paper focus:outline-none focus:border-fantasy-gold"
             value={password}
@@ -75,6 +81,9 @@ export default function RegisterForm({ onBackToLogin }) {
           <input 
             required
             type="password" 
+            minLength={12}
+            maxLength={128}
+            autoComplete="new-password"
             placeholder="Confirmar contraseña"
             className="w-full bg-black border border-fantasy-wood p-2 pl-10 rounded text-fantasy-paper focus:outline-none focus:border-fantasy-gold"
             value={confirmPassword}

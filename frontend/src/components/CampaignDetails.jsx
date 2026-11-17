@@ -1,21 +1,18 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
-import { useAuthStore } from '../store/authStore';
 import { Users, Crown, ChevronLeft, Map, UserCircle, Hash } from 'lucide-react';
+import ProtectedAssetImage from './ProtectedAssetImage';
 
 export default function CampaignDetails({ campanaId, onBack }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
-  const token = useAuthStore((state) => state.token);
 
   useEffect(() => {
     const fetchDetail = async () => {
       try {
-        const res = await api.get(`/campanas/${campanaId}`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+        const res = await api.get(`/campanas/${campanaId}`);
         setData(res.data.campana);
-      } catch (err) {
+      } catch {
         alert("Error al cargar la gesta.");
         onBack();
       } finally {
@@ -23,7 +20,7 @@ export default function CampaignDetails({ campanaId, onBack }) {
       }
     };
     fetchDetail();
-  }, [campanaId]);
+  }, [campanaId, onBack]);
 
   if (loading) return <div className="p-20 text-center animate-pulse text-fantasy-gold">Consultando los oráculos...</div>;
 
@@ -85,7 +82,7 @@ export default function CampaignDetails({ campanaId, onBack }) {
                 {data.assets.map(a => (
                   <div key={a.id} className="group relative aspect-square bg-black rounded-lg overflow-hidden border border-fantasy-wood/50 hover:border-fantasy-gold transition-all">
                     {a.url ? (
-                      <img src={a.url} alt={a.nombre} className="w-full h-full object-cover opacity-60 group-hover:opacity-100 transition-opacity" />
+                      <ProtectedAssetImage assetId={a.id} alt={a.nombre} className="w-full h-full object-cover opacity-60 group-hover:opacity-100 transition-opacity" />
                     ) : (
                       <div className="flex items-center justify-center h-full opacity-20"><UserCircle size={40} /></div>
                     )}
