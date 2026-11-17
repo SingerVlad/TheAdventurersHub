@@ -56,7 +56,8 @@ pip install -r requirements.txt
 
 # Configurar variables de entorno
 cp .env.example .env
-# Edita .env con tus llaves (GROQ_API_KEY, HUGGINGFACE_API_KEY, SECRET_KEY, etc.)
+# Genera un SECRET_KEY privado: python -c "import secrets; print(secrets.token_urlsafe(48))"
+# Configura las claves de proveedores solo si utilizarás esas integraciones.
 
 # Iniciar servidor Flask (puerto 5000)
 python app.py

@@ -1,21 +1,52 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Sword, LogOut, Settings, LayoutDashboard, Scroll, UserPlus } from 'lucide-react';
 import LoginForm from './components/LoginForm';
 import RegisterForm from './components/RegisterForm';
 import Dashboard from './components/Dashboard';
 import Gallery from './components/Gallery';
 import IALab from './components/IALab';
-import CampaignDetails from './components/CampaignDetails'; // Asegúrate de tener este archivo
+import CampaignDetails from './components/CampaignDetails';
 import { useAuthStore } from './store/authStore';
+import { api, setCsrfToken } from './api';
 
 function App() {
   const [showLogin, setShowLogin] = useState(false);
   const [showRegister, setShowRegister] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [selectedCampaignId, setSelectedCampaignId] = useState(null);
-  const { token, logout } = useAuthStore();
+  const [authReady, setAuthReady] = useState(false);
+  const { isAuthenticated, logout, setAuthenticated } = useAuthStore();
+  const handleBackToDashboard = useCallback(() => {
+    setSelectedCampaignId(null);
+    setActiveTab('dashboard');
+  }, []);
 
-  const handleLogout = () => {
+  useEffect(() => {
+    let active = true;
+    api.get('/csrf')
+      .then(({ data }) => {
+        if (!active) return;
+        setCsrfToken(data.csrf_token);
+        setAuthenticated(true);
+      })
+      .catch(() => {
+        if (!active) return;
+        setCsrfToken(null);
+        logout();
+      })
+      .finally(() => {
+        if (active) setAuthReady(true);
+      });
+    return () => { active = false; };
+  }, [logout, setAuthenticated]);
+
+  const handleLogout = async () => {
+    try {
+      await api.post('/logout');
+    } catch {
+      // La sesión local se limpia incluso si ya expiró en el servidor.
+    }
+    setCsrfToken(null);
     logout();
     setActiveTab('dashboard');
     setSelectedCampaignId(null);
@@ -23,17 +54,15 @@ function App() {
     setShowRegister(false);
   };
 
-  // Función para volver a la lista de campañas
-  const handleBackToDashboard = () => {
-    setSelectedCampaignId(null);
-    setActiveTab('dashboard');
-  };
+  if (!authReady) {
+    return <main className="min-h-screen bg-fantasy-dark flex items-center justify-center text-fantasy-paper">Cargando sesión...</main>;
+  }
 
   return (
     <div className="min-h-screen bg-fantasy-dark flex flex-col items-center">
       
       {/* NAVEGACIÓN (Solo si está logueado) */}
-      {token && (
+      {isAuthenticated && (
         <nav className="w-full bg-black/50 border-b border-fantasy-wood p-4 flex justify-between items-center px-8 sticky top-0 z-50 backdrop-blur-md">
           <div className="flex items-center gap-2 cursor-pointer" onClick={handleBackToDashboard}>
             <Sword className="text-fantasy-gold w-6 h-6" />
@@ -70,7 +99,7 @@ function App() {
 
       {/* CONTENIDO PRINCIPAL */}
       <main className="flex-1 w-full flex flex-col items-center p-4">
-        {!token ? (
+        {!isAuthenticated ? (
           // --- VISTAS NO LOGUEADO ---
           showRegister ? (
             <div className="mt-20 w-full flex justify-center">
@@ -134,5 +163,4 @@ function App() {
   );
 }
 
-// ESTA LÍNEA ES LA QUE TE FALTABA O SE ROMPIÓ:
 export default App;

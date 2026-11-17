@@ -50,6 +50,9 @@ jobs:
         run: |
           python -m py_compile app.py
 
+      - name: Ejecutar comprobaciones de seguridad
+        run: python -m unittest discover -s tests
+
   frontend-check:
     name: Frontend (React / Vite)
     runs-on: ubuntu-latest

@@ -1,13 +1,13 @@
 import { useState } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { Lock, User } from 'lucide-react';
-import {api} from '../api';
+import { api, setCsrfToken } from '../api';
 
 export default function LoginForm() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
-  const setToken = useAuthStore((state) => state.setToken);
+  const setAuthenticated = useAuthStore((state) => state.setAuthenticated);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -16,10 +16,11 @@ export default function LoginForm() {
         username,
         password
       });
-      setToken(res.data.token); // Guardamos el token en nuestro cofre
+      setCsrfToken(res.data.csrf_token);
+      setAuthenticated(true);
       alert("¡Bienvenido a la taberna, " + username + "!");
     } catch (err) {
-      setError(err.response?.data?.error || 'Error al conectar con el servidor', err);
+      setError(err.response?.data?.error || 'Error al conectar con el servidor');
     }
   };
 

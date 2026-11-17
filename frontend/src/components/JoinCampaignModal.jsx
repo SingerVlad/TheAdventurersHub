@@ -1,12 +1,10 @@
 import { useState } from 'react';
 import { api } from '../api';
-import { useAuthStore } from '../store/authStore';
 import { X, DoorOpen, Sparkles } from 'lucide-react';
 
 export default function JoinCampaignModal({ isOpen, onClose, onRefresh }) {
   const [codigo, setCodigo] = useState('');
   const [loading, setLoading] = useState(false);
-  const token = useAuthStore((state) => state.token);
 
   if (!isOpen) return null;
 
@@ -14,10 +12,7 @@ export default function JoinCampaignModal({ isOpen, onClose, onRefresh }) {
     e.preventDefault();
     setLoading(true);
     try {
-      await api.post('/campanas/unirse', 
-        { codigo },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
+      await api.post('/campanas/unirse', { codigo });
       onRefresh();
       onClose();
       setCodigo('');

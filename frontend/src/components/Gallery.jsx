@@ -1,23 +1,20 @@
 import { useEffect, useState } from 'react';
-import { useAuthStore } from '../store/authStore';
 import { 
   Scroll, Trash2, RefreshCw, Image as ImageIcon, 
   Filter, UserCircle, Map as MapIcon, Search 
 } from 'lucide-react';
 import { api } from '../api';
+import ProtectedAssetImage from './ProtectedAssetImage';
 
 export default function Gallery() {
   const [assets, setAssets] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('todos'); // 'todos', 'NPC', 'Retrato'
-  const token = useAuthStore((state) => state.token);
 
   const fetchAssets = async () => {
     setLoading(true);
     try {
-      const res = await api.get('/assets', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await api.get('/assets');
       setAssets(res.data.assets);
     } catch (err) {
       console.error("Error al cargar la galería:", err);
@@ -32,7 +29,7 @@ export default function Gallery() {
     if (!window.confirm("¿Deseas eliminar este registro permanentemente de tus crónicas?")) return;
     try {
       // Asumiendo que crearás este endpoint en el futuro
-      // await api.delete(`/assets/${id}`, { headers: { Authorization: `Bearer ${token}` } });
+      // await api.delete(`/assets/${id}`);
       setAssets(assets.filter(a => a.id !== id));
       alert("Registro borrado.");
     } catch { alert("No se pudo borrar el registro."); }
@@ -103,8 +100,8 @@ export default function Gallery() {
                 {/* ZONA DE IMAGEN / PREVISUALIZACIÓN */}
                 <div className="h-56 w-full bg-black relative overflow-hidden flex items-center justify-center border-b border-fantasy-wood/50">
                   {asset.url ? (
-                    <img 
-                      src={asset.url} 
+                    <ProtectedAssetImage
+                      assetId={asset.id}
                       alt={asset.nombre} 
                       className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-1000 opacity-80 group-hover:opacity-100"
                     />

@@ -14,7 +14,7 @@ La rama de integración es `develop`; los pull requests deben apuntar a ella. `m
    pip install -r requirements.txt
    ```
 
-3. Copia `.env.example` a `.env` y genera un `SECRET_KEY` privado. Las claves de proveedores de IA solo son necesarias para usar esas integraciones.
+3. Copia `.env.example` a `.env` y genera un `SECRET_KEY` privado con `python -c "import secrets; print(secrets.token_urlsafe(48))"`. El servidor no inicia si la clave falta o es débil. Las claves de proveedores de IA solo son necesarias para usar esas integraciones.
 4. Configura el frontend e inicia ambos servidores:
 
    ```bash
@@ -61,7 +61,7 @@ npm run lint
 npm run build
 ```
 
-La CI valida sintaxis de Python, lint y build del frontend, además de los Conventional Commits. El repositorio todavía no tiene pruebas automatizadas de comportamiento; identifica esa limitación cuando afecte la validación.
+La CI valida sintaxis y controles básicos de seguridad del backend, lint y build del frontend, además de los Conventional Commits. La cobertura todavía no reemplaza pruebas de integración con MongoDB ni pruebas de autorización entre cuentas; identifica esa limitación cuando afecte la validación.
 
 El PR debe explicar el objetivo, alcance, riesgos, comprobaciones ejecutadas y cualquier punto pendiente. Incluye capturas para cambios visuales y actualiza documentación cuando cambie la configuración o el comportamiento.
 

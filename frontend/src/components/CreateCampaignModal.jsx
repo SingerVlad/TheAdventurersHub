@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { useAuthStore } from '../store/authStore';
 import { X, ShieldCheck, Sword } from 'lucide-react';
 import {api} from '../api';
 
@@ -7,7 +6,6 @@ export default function CreateCampaignModal({ isOpen, onClose, onRefresh }) {
   const [nombre, setNombre] = useState('');
   const [descripcion, setDescripcion] = useState('');
   const [loading, setLoading] = useState(false);
-  const token = useAuthStore((state) => state.token);
 
   if (!isOpen) return null;
 
@@ -15,10 +13,7 @@ export default function CreateCampaignModal({ isOpen, onClose, onRefresh }) {
     e.preventDefault();
     setLoading(true);
     try {
-      await api.post('/campanas', 
-        { nombre, descripcion },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
+      await api.post('/campanas', { nombre, descripcion });
       onRefresh(); // Recargamos la lista de campañas
       onClose(); // Cerramos el modal
       setNombre('');

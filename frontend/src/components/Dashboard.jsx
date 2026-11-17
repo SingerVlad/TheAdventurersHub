@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react';
-import { useAuthStore } from '../store/authStore';
 import CampaignCard from './CampaignCard';
 import CreateCampaignModal from './CreateCampaignModal';
 import { PlusCircle, RefreshCw, Dice5, ExternalLink, DoorOpen } from 'lucide-react'; // Añadidos iconos
@@ -12,15 +11,12 @@ export default function Dashboard({onSelectCampaign}) {
   const [campaigns, setCampaigns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const token = useAuthStore((state) => state.token);
   const [isJoinModalOpen, setIsJoinModalOpen] = useState(false);
 
   const fetchCampaigns = async () => {
     setLoading(true);
     try {
-      const res = await api.get('/campanas', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await api.get('/campanas');
       setCampaigns(res.data.mis_campanas);
     } catch (err) {
       console.error("Error al cargar campañas", err);
