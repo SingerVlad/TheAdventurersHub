@@ -19,7 +19,7 @@ Auditoría de código realizada el 16 de noviembre de 2026. Este registro descri
 1. **Migración de usuarios:** comprobar duplicados de `usuarios.username` y crear el índice único en una operación de mantenimiento antes del despliegue. El registro devuelve `503` mientras no pueda verificar ese índice.
 2. **Sesiones:** añadir revocación de sesiones/tokens y una política de rotación. Cerrar sesión borra la cookie del navegador; un token robado aún puede usarse hasta su expiración.
 3. **Abuso y costos:** definir límites por plan y presupuestos de proveedor para IA. El límite actual es una defensa por ventana, no un sistema de cuotas comerciales ni detección de abuso.
-4. **Proxy de producción:** configurar TLS y una única cadena de proxies de confianza; confirmar que la IP usada por los límites de login/registro sea la del cliente y no una IP compartida del proxy.
+4. **Proxy de producción:** configurar TLS y establecer `TRUST_PROXY_COUNT` según la cantidad exacta de proxies confiables. Compose lo establece en `1` detrás de Nginx; el backend no publica su puerto.
 5. **Archivos:** migrar el almacenamiento local a almacenamiento de objetos privado y controlado, con política de retención, antivirus/decodificación segura y URLs firmadas o entrega autorizada. La firma PNG y el límite de tamaño no sustituyen una decodificación y recodificación de imagen.
 6. **Ciclo de vida de cuentas:** implementar verificación de correo, recuperación segura de contraseña, cierre/eliminación de cuenta, exportación y retención/eliminación de campañas.
 7. **Operación:** usar secretos gestionados, MongoDB con TLS y privilegio mínimo, backups cifrados y probados, monitorización de autenticación/abuso y proceso de respuesta a incidentes.

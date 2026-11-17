@@ -20,6 +20,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.exceptions import HTTPException
+from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 
 import time
@@ -98,6 +99,20 @@ FOUNDRY_DATA_PATH = Path(os.getenv("FOUNDRY_DATA_PATH", "./var/foundry/imports")
 
 mongo = PyMongo(app)
 _rate_limit_index_ready = False
+
+try:
+    trusted_proxy_count = int(os.getenv("TRUST_PROXY_COUNT", "0"))
+except ValueError as error:
+    raise RuntimeError("TRUST_PROXY_COUNT debe ser un entero no negativo.") from error
+if trusted_proxy_count < 0:
+    raise RuntimeError("TRUST_PROXY_COUNT debe ser un entero no negativo.")
+if trusted_proxy_count:
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app,
+        x_for=trusted_proxy_count,
+        x_proto=trusted_proxy_count,
+        x_host=trusted_proxy_count,
+    )
 
 # GUARDIA DE SEGURIDAD (Decorador JWT)
 # ==========================================

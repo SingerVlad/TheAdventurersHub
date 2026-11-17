@@ -37,6 +37,43 @@ Plataforma web integral para la gestión de campañas de juegos de rol (D&D 5e),
 
 ## 🚀 Instalación y Ejecución Local
 
+### Ejecutar todo con Docker Compose
+
+Requisitos: Docker Desktop con Docker Compose v2.
+
+Si todavía no tienes `.env`, crea uno a partir del ejemplo. En PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Si `.env` ya existe, no lo sobrescribas: agrega o ajusta `MONGO_ROOT_USERNAME`, `MONGO_ROOT_PASSWORD`, `MONGO_APP_USERNAME` y `MONGO_APP_PASSWORD`. Configura también `SECRET_KEY` si aún está vacío. Usa los nombres `adventurers_root` y `adventurers_app`; genera las contraseñas con este comando:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Usa el primer comando para `SECRET_KEY` y el segundo para ambas contraseñas MongoDB. Las contraseñas Mongo deben mantenerse hexadecimales para que la URI de conexión no requiera escape adicional. Luego inicia la plataforma:
+
+```bash
+docker compose up --build -d
+```
+
+Abre [http://localhost:8080](http://localhost:8080). La API y MongoDB solo son accesibles dentro de la red privada de Compose; MongoDB conserva los datos en el volumen `mongo_data` y los retratos en `foundry_assets`.
+
+Comandos útiles:
+
+```bash
+docker compose ps
+docker compose logs -f backend frontend mongo
+docker compose down
+```
+
+`docker compose down` conserva los volúmenes. `docker compose down -v` también elimina permanentemente la base de datos y los retratos. No ejecutes esta última instrucción si necesitas conservar datos.
+
+Foundry VTT continúa ejecutándose fuera de Compose; configura `VITE_FOUNDRY_URL` para que el navegador pueda abrir esa instalación. Para hacer la web accesible desde otros equipos, define `WEB_BIND_ADDRESS=0.0.0.0` y limita el acceso con el firewall. Este Compose está preparado para desarrollo local. En producción se requiere terminar TLS en un proxy y establecer `APP_ENV=production`, `COOKIE_SECURE=true`, `TRUST_PROXY_COUNT` con el número exacto de proxies y orígenes HTTPS en `CORS_ORIGINS`; gestiona las credenciales con el almacén de secretos de la plataforma.
+
 ### 1. Requisitos Previos
 - **Python 3.11+**
 - **Node.js 20+** y **npm**
@@ -82,10 +119,10 @@ npm run dev
 | Método | Ruta | Auth | Descripción |
 | :--- | :--- | :---: | :--- |
 | `POST` | `/api/registro` | ❌ | Registro de nuevo usuario |
-| `POST` | `/api/login` | ❌ | Inicio de sesión y entrega de JWT (24h) |
+| `POST` | `/api/login` | ❌ | Inicio de sesión con JWT en cookie `HttpOnly` (30 minutos) |
 | `GET` | `/api/perfil` | ✅ | Datos del usuario autenticado |
 | `GET` | `/api/campanas` | ✅ | Lista campañas donde el usuario es DM o Jugador |
-| `POST` | `/api/campanas` | ✅ | Crea una campaña y genera `codigo_invitacion` (6 caracteres) |
+| `POST` | `/api/campanas` | ✅ | Crea una campaña y genera `codigo_invitacion` (8 caracteres) |
 | `POST` | `/api/campanas/unirse` | ✅ | Une al usuario a una campaña mediante código |
 | `GET` | `/api/campanas/<campana_id>` | ✅ | Detalle de campaña, miembros y assets vinculados |
 | `POST` | `/api/ia/npc-rapido` | ✅ | Genera un NPC estructurado (JSON) con Groq (`llama-3.1-8b-instant`) |
