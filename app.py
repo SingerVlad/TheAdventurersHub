@@ -17,7 +17,7 @@ from flask_pymongo import PyMongo
 from bson.objectid import ObjectId
 from bson.errors import InvalidId
 from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -370,19 +370,33 @@ def crear_campana(usuario_actual):
     if not isinstance(descripcion, str) or len(descripcion) > 2000:
         return jsonify({"error": "La descripción no puede superar 2000 caracteres"}), 400
 
+    campanas = mongo.db.campanas
+    try:
+        campanas.create_index("codigo_invitacion", unique=True)
+    except PyMongoError:
+        app.logger.exception("No se pudo verificar el índice único de invitaciones")
+        return jsonify({"error": "La creación de campañas no está disponible"}), 503
+
     nueva_campana = {
         "nombre": nombre.strip(),
         "descripcion": descripcion.strip(),
-        "codigo_invitacion": "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8)),
-        "dm_id": usuario_actual['_id'],
-        "jugadores": [] # Lista de IDs de jugadores unidos
+        "dm_id": usuario_actual["_id"],
+        "jugadores": [],
     }
-    resultado = mongo.db.campanas.insert_one(nueva_campana)
-    return jsonify({
-        "status": "success", 
-        "id": str(resultado.inserted_id),
-        "codigo": nueva_campana['codigo_invitacion']
-    }), 201
+    for _ in range(3):
+        codigo = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+        nueva_campana["codigo_invitacion"] = codigo
+        try:
+            resultado = campanas.insert_one(nueva_campana.copy())
+        except DuplicateKeyError:
+            continue
+        return jsonify({
+            "status": "success",
+            "id": str(resultado.inserted_id),
+            "codigo": codigo,
+        }), 201
+
+    return jsonify({"error": "No se pudo generar un código de invitación. Intenta de nuevo."}), 503
 
 
 
