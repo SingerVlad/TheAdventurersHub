@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 import time
 import requests
+import click
 
 load_dotenv()
 
@@ -355,6 +356,47 @@ def obtener_perfil(usuario_actual):
         }
     }), 200
 
+def preparar_indices():
+    """Crea el índice de invitaciones antes de iniciar el servidor."""
+    campanas = mongo.db.campanas
+    try:
+        indices = campanas.index_information()
+        if any(
+            indice.get("key") == [("codigo_invitacion", 1)]
+            and indice.get("unique")
+            and not indice.get("sparse")
+            and not indice.get("partialFilterExpression")
+            for indice in indices.values()
+        ):
+            return
+
+        duplicados = campanas.aggregate([
+            {"$group": {"_id": "$codigo_invitacion", "cantidad": {"$sum": 1}}},
+            {"$match": {"cantidad": {"$gt": 1}}},
+            {"$limit": 1},
+        ])
+        if next(duplicados, None) is not None:
+            raise click.ClickException(
+                "Hay códigos de invitación duplicados o varias campañas sin código. "
+                "Corrige esos registros antes de iniciar el servidor."
+            )
+        campanas.create_index("codigo_invitacion", unique=True)
+    except DuplicateKeyError as error:
+        raise click.ClickException(
+            "MongoDB encontró códigos de invitación duplicados al crear el índice."
+        ) from error
+    except PyMongoError as error:
+        raise click.ClickException(
+            "No se pudo preparar el índice de invitaciones. Revisa la conexión y los índices de MongoDB."
+        ) from error
+
+
+@app.cli.command("preparar-indices")
+def preparar_indices_cli():
+    """Prepara los índices requeridos por campañas."""
+    preparar_indices()
+
+
 @app.route('/api/campanas', methods=['POST'])
 @token_required
 @rate_limit("crear-campana", limit=10, window_seconds=86400, authenticated=True)
@@ -371,11 +413,6 @@ def crear_campana(usuario_actual):
         return jsonify({"error": "La descripción no puede superar 2000 caracteres"}), 400
 
     campanas = mongo.db.campanas
-    try:
-        campanas.create_index("codigo_invitacion", unique=True)
-    except PyMongoError:
-        app.logger.exception("No se pudo verificar el índice único de invitaciones")
-        return jsonify({"error": "La creación de campañas no está disponible"}), 503
 
     nueva_campana = {
         "nombre": nombre.strip(),
@@ -971,6 +1008,11 @@ def obtener_detalle_campana(usuario_actual, campana_id):
         return jsonify({"error": "No se pudo obtener la campaña"}), 500
 
 if __name__ == '__main__':
+    try:
+        preparar_indices()
+    except click.ClickException as error:
+        error.show()
+        raise SystemExit(error.exit_code) from None
     app.run(
         debug=False,
         host=os.getenv("APP_HOST", "127.0.0.1"),

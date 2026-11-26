@@ -18,4 +18,4 @@ COPY --chown=app:app app.py ./app.py
 USER app
 EXPOSE 5000
 
-CMD ["sh", "-c", "exec gunicorn --workers ${WEB_CONCURRENCY:-2} --bind 0.0.0.0:5000 --access-logfile - --error-logfile - --timeout 240 app:app"]
+CMD ["sh", "-c", "flask --app app preparar-indices && exec gunicorn --workers ${WEB_CONCURRENCY:-2} --bind 0.0.0.0:5000 --access-logfile - --error-logfile - --timeout 240 app:app"]

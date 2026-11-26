@@ -74,6 +74,11 @@ docker compose down
 
 Foundry VTT continúa ejecutándose fuera de Compose; configura `VITE_FOUNDRY_URL` para que el navegador pueda abrir esa instalación. Para hacer la web accesible desde otros equipos, define `WEB_BIND_ADDRESS=0.0.0.0` y limita el acceso con el firewall. Este Compose está preparado para desarrollo local. En producción se requiere terminar TLS en un proxy y establecer `APP_ENV=production`, `COOKIE_SECURE=true`, `TRUST_PROXY_COUNT` con el número exacto de proxies y orígenes HTTPS en `CORS_ORIGINS`; gestiona las credenciales con el almacén de secretos de la plataforma.
 
+El backend prepara el índice único de invitaciones antes de iniciar. Si ya existen códigos repetidos,
+revisa y corrige esos registros antes de volver a iniciar. El arranque no modifica los códigos existentes.
+Para iniciar Flask o Gunicorn manualmente desde otro punto de entrada, ejecuta primero
+`python -m flask --app app preparar-indices`. Docker Compose y `python app.py` ya lo ejecutan.
+
 ### 1. Requisitos Previos
 - **Python 3.11+**
 - **Node.js 20+** y **npm**
