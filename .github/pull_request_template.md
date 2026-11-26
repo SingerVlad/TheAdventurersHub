@@ -10,6 +10,7 @@ Describe el problema o necesidad y el resultado que persigue este cambio.
 ## Validación
 
 - [ ] `python -m py_compile app.py` (si afecta al backend)
+- [ ] `python -m unittest discover -s tests` (si afecta seguridad, autenticación, API o persistencia)
 - [ ] `npm run lint` (si afecta al frontend)
 - [ ] `npm run build` (si afecta al frontend)
 - [ ] Revisé permisos, validación de entradas y exposición de datos (si afecta API, autenticación o archivos)
