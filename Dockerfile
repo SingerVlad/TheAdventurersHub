@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt gunicorn==23.0.0 \
     && chown -R app:app /data/foundry
 
 COPY --chown=app:app app.py ./app.py
+COPY --chown=app:app backend ./backend
 
 USER app
 EXPOSE 5000

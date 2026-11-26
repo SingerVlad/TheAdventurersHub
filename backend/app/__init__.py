@@ -1,0 +1,1 @@
+"""Aplicación modular por dominios."""
