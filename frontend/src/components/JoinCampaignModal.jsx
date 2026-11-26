@@ -5,11 +5,13 @@ import { X, DoorOpen, Sparkles } from 'lucide-react';
 export default function JoinCampaignModal({ isOpen, onClose, onRefresh }) {
   const [codigo, setCodigo] = useState('');
   const [loading, setLoading] = useState(false);
+  const codigoValido = /^[A-Z0-9]{6,8}$/.test(codigo);
 
   if (!isOpen) return null;
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (loading || !codigoValido) return;
     setLoading(true);
     try {
       await api.post('/campanas/unirse', { codigo });
@@ -36,21 +38,24 @@ export default function JoinCampaignModal({ isOpen, onClose, onRefresh }) {
 
         <form onSubmit={handleSubmit} className="p-6 space-y-6">
           <div className="text-center">
-            <p className="text-gray-400 text-sm italic mb-4">Introduce el código secreto entregado por tu Dungeon Master.</p>
+            <label htmlFor="codigo-invitacion" className="block text-gray-400 text-sm italic mb-4">Código de invitación de 6 a 8 caracteres</label>
             <input 
               required
               type="text" 
-              maxLength={6}
+              id="codigo-invitacion"
+              minLength={6}
+              maxLength={8}
+              pattern="[A-Za-z0-9]{6,8}"
               className="w-full bg-black border-2 border-fantasy-wood p-4 rounded text-center text-3xl font-mono text-fantasy-gold tracking-[0.5em] focus:border-fantasy-gold outline-none uppercase"
-              placeholder="ABC123"
+              placeholder="ABCD2345"
               value={codigo}
-              onChange={(e) => setCodigo(e.target.value)}
+              onChange={(e) => setCodigo(e.target.value.toUpperCase())}
             />
           </div>
 
           <button 
             type="submit"
-            disabled={loading || codigo.length < 4}
+            disabled={loading || !codigoValido}
             className="w-full bg-fantasy-wood hover:bg-blue-800 text-white font-black py-4 rounded uppercase tracking-widest flex items-center justify-center gap-2 transition-all disabled:opacity-50"
           >
             {loading ? "BUSCANDO GRUPO..." : "ENTRAR A LA PARTIDA"}

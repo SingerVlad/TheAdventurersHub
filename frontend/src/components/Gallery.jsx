@@ -9,6 +9,7 @@ import ProtectedAssetImage from './ProtectedAssetImage';
 export default function Gallery() {
   const [assets, setAssets] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [deletingId, setDeletingId] = useState(null);
   const [filter, setFilter] = useState('todos'); // 'todos', 'NPC', 'Retrato'
 
   const fetchAssets = async () => {
@@ -27,12 +28,16 @@ export default function Gallery() {
 
   const handleDelete = async (id) => {
     if (!window.confirm("¿Deseas eliminar este registro permanentemente de tus crónicas?")) return;
+    setDeletingId(id);
     try {
-      // Asumiendo que crearás este endpoint en el futuro
-      // await api.delete(`/assets/${id}`);
-      setAssets(assets.filter(a => a.id !== id));
+      await api.delete(`/assets/${id}`);
+      setAssets(currentAssets => currentAssets.filter(asset => asset.id !== id));
       alert("Registro borrado.");
-    } catch { alert("No se pudo borrar el registro."); }
+    } catch {
+      alert("No se pudo borrar el registro.");
+    } finally {
+      setDeletingId(null);
+    }
   };
 
   // Filtrado lógico
@@ -70,7 +75,7 @@ export default function Gallery() {
             RETRATOS
           </button>
           <div className="w-[1px] h-6 bg-gray-800 mx-2" />
-          <button onClick={fetchAssets} className="p-2 text-fantasy-gold hover:rotate-180 transition-transform duration-500">
+          <button onClick={fetchAssets} disabled={loading || deletingId !== null} aria-label="Actualizar galería" className="p-2 text-fantasy-gold hover:rotate-180 transition-transform duration-500">
             <RefreshCw size={20} className={loading ? 'animate-spin' : ''} />
           </button>
         </div>
@@ -151,6 +156,8 @@ export default function Gallery() {
                       <span className="text-[9px] font-bold text-gray-400 uppercase">ID: #{asset.id}</span>
                       <button 
                         onClick={() => handleDelete(asset.id)}
+                        disabled={deletingId !== null}
+                        aria-label={deletingId === asset.id ? "Eliminando registro" : "Eliminar registro"}
                         className="p-2 text-red-900/40 hover:text-red-600 hover:bg-red-100 rounded-full transition-all"
                       >
                         <Trash2 size={18} />
