@@ -1,6 +1,6 @@
 # Contribuir
 
-La rama de integración es `develop`; los pull requests deben apuntar a ella. `main` se reserva para versiones estables. Consulta [AGENTS.md](AGENTS.md) para las reglas completas de arquitectura, seguridad y colaboración.
+La rama de integración es `develop`; los pull requests de cambios normales deben apuntar a ella. `main` se reserva para lanzamientos o integraciones de versión. Consulta [AGENTS.md](AGENTS.md) para las reglas completas de arquitectura, seguridad y colaboración.
 
 ## Configuración local
 
@@ -56,12 +56,13 @@ Antes de abrir el PR, ejecuta lo que corresponda al cambio:
 
 ```bash
 python -m py_compile app.py
+python -m unittest discover -s tests
 cd frontend
 npm run lint
 npm run build
 ```
 
-La CI valida sintaxis y controles básicos de seguridad del backend, lint y build del frontend, además de los Conventional Commits. La cobertura todavía no reemplaza pruebas de integración con MongoDB ni pruebas de autorización entre cuentas; identifica esa limitación cuando afecte la validación.
+La CI valida sintaxis y controles básicos de seguridad del backend, lint y build del frontend, además de los Conventional Commits. Ejecuta la suite de backend cuando el cambio afecte autenticación, autorización, API o persistencia. La cobertura actual no reemplaza pruebas de integración con MongoDB ni cubre todos los permisos entre cuentas; identifica esa limitación cuando afecte la validación.
 
 El PR debe explicar el objetivo, alcance, riesgos, comprobaciones ejecutadas y cualquier punto pendiente. Incluye capturas para cambios visuales y actualiza documentación cuando cambie la configuración o el comportamiento.
 

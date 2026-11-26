@@ -75,7 +75,7 @@ docker compose down
 Foundry VTT continúa ejecutándose fuera de Compose; configura `VITE_FOUNDRY_URL` para que el navegador pueda abrir esa instalación. Para hacer la web accesible desde otros equipos, define `WEB_BIND_ADDRESS=0.0.0.0` y limita el acceso con el firewall. Este Compose está preparado para desarrollo local. En producción se requiere terminar TLS en un proxy y establecer `APP_ENV=production`, `COOKIE_SECURE=true`, `TRUST_PROXY_COUNT` con el número exacto de proxies y orígenes HTTPS en `CORS_ORIGINS`; gestiona las credenciales con el almacén de secretos de la plataforma.
 
 ### 1. Requisitos Previos
-- **Python 3.11+**
+- **Python 3.12+**
 - **Node.js 20+** y **npm**
 - **MongoDB** ejecutándose localmente (`mongodb://localhost:27017`)
 
@@ -103,7 +103,7 @@ python app.py
 ### 3. Configurar Frontend
 ```bash
 cd frontend
-npm install
+npm ci
 
 # (Opcional) Configurar variables de entorno locales
 cp .env.example .env
