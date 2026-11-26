@@ -1,6 +1,10 @@
 import hashlib
 import hmac
+from urllib.parse import urlencode, urlparse
+
 import requests
+
+from backend.app.config import DEFAULT_FLOW_API_URLS, OFFICIAL_FLOW_HOSTS
 
 
 class FlowError(Exception):
@@ -41,6 +45,30 @@ def verify_flow_signature(params, signature, secret_key):
     return hmac.compare_digest(expected, signature)
 
 
+def validate_flow_payment_url(raw_url, flow_env):
+    """Valida que la URL de pago devuelta por Flow use HTTPS y el dominio oficial del ambiente."""
+    expected_host = OFFICIAL_FLOW_HOSTS.get(flow_env)
+    if not expected_host:
+        raise FlowConfigurationError("FLOW_ENV no es válido para verificar URLs de Flow.")
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        raise FlowProviderError("Flow no devolvió una URL de pago válida.")
+
+    cleaned = raw_url.strip()
+    parsed = urlparse(cleaned)
+    hostname = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme != "https"
+        or hostname != expected_host
+        or parsed.port not in (None, 443)
+        or parsed.username
+        or parsed.password
+    ):
+        raise FlowProviderError(
+            "La URL de pago devuelta por Flow no pertenece al dominio oficial esperado."
+        )
+    return cleaned
+
+
 class FlowClient:
     """Cliente HTTP aislado para la API REST de Flow (Sandbox / Producción)."""
 
@@ -48,22 +76,30 @@ class FlowClient:
         self,
         api_key,
         secret_key,
-        api_url="https://sandbox.flow.cl/api",
+        api_url=None,
+        flow_env="sandbox",
         timeout=20,
         session=None,
     ):
+        self.flow_env = (flow_env or "sandbox").strip().lower()
+        if self.flow_env not in OFFICIAL_FLOW_HOSTS:
+            raise FlowConfigurationError("FLOW_ENV debe ser 'sandbox' o 'production'.")
+
+        default_url = DEFAULT_FLOW_API_URLS[self.flow_env]
         self.api_key = (api_key or "").strip()
         self.secret_key = (secret_key or "").strip()
-        self.api_url = (api_url or "https://sandbox.flow.cl/api").strip().rstrip("/")
+        self.api_url = (api_url or default_url).strip().rstrip("/")
         self.timeout = timeout
         self._http = session or requests
 
     @classmethod
     def from_app_config(cls, config):
+        flow_env = config.get("FLOW_ENV", "sandbox")
         return cls(
             api_key=config.get("FLOW_API_KEY", ""),
             secret_key=config.get("FLOW_SECRET_KEY", ""),
-            api_url=config.get("FLOW_API_URL", "https://sandbox.flow.cl/api"),
+            api_url=config.get("FLOW_API_URL"),
+            flow_env=flow_env,
         )
 
     def _ensure_configured(self):
@@ -71,6 +107,7 @@ class FlowClient:
             raise FlowConfigurationError(
                 "Las credenciales de Flow no están configuradas en el servidor."
             )
+        validate_flow_payment_url(self.api_url, self.flow_env)
 
     def create_payment(
         self,
@@ -119,17 +156,19 @@ class FlowClient:
         except ValueError as error:
             raise FlowProviderError("Respuesta inválida desde Flow en payment/create.") from error
 
-        base_url = data.get("url") if isinstance(data, dict) else None
+        raw_url = data.get("url") if isinstance(data, dict) else None
         token = data.get("token") if isinstance(data, dict) else None
-        if not isinstance(base_url, str) or not base_url or not isinstance(token, str) or not token:
-            raise FlowProviderError("Flow no devolvió url o token válidos.")
+        if not isinstance(token, str) or not token.strip():
+            raise FlowProviderError("Flow no devolvió un token válido.")
 
+        base_url = validate_flow_payment_url(raw_url, self.flow_env)
+        clean_token = token.strip()
         separador = "&" if "?" in base_url else "?"
         return {
             "url": base_url,
-            "token": token,
+            "token": clean_token,
             "flow_order": data.get("flowOrder"),
-            "redirect_url": f"{base_url}{separador}token={token}",
+            "redirect_url": f"{base_url}{separador}{urlencode({'token': clean_token})}",
         }
 
     def get_status(self, token):

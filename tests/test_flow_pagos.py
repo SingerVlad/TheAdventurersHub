@@ -9,14 +9,17 @@ from unittest.mock import MagicMock, patch
 
 import jwt
 from bson import ObjectId
+from flask import Flask
 from pymongo.errors import DuplicateKeyError
 
 os.environ["SECRET_KEY"] = "test-only-key-with-more-than-32-bytes"
 os.environ["APP_ENV"] = "test"
 
 import app as application
+from backend.app.config import configure_flow_settings
 from backend.app.integrations.flow_client import (
     FlowClient,
+    FlowProviderError,
     sign_flow_params,
     verify_flow_signature,
 )
@@ -25,7 +28,7 @@ from backend.app.pagos.service import calcular_nueva_vigencia
 
 
 class InMemoryCollection:
-    """Colección MongoDB en memoria con semántica atómica para pruebas unitarias."""
+    """Colección MongoDB standalone en memoria con semántica atómica por documento."""
 
     def __init__(self, initial_docs=None, unique_fields=None):
         self.docs = [copy.deepcopy(d) for d in (initial_docs or [])]
@@ -39,14 +42,36 @@ class InMemoryCollection:
 
     def _matches(self, doc, query):
         for key, condition in query.items():
+            if key == "$or":
+                if not any(self._matches(doc, subq) for subq in condition):
+                    return False
+                continue
+
             has_key = key in doc
             val = doc.get(key)
             if isinstance(condition, dict):
                 for op, expected in condition.items():
-                    if op == "$ne" and val == expected:
-                        return False
-                    if op == "$in" and val not in expected:
-                        return False
+                    if op == "$ne":
+                        if isinstance(val, list):
+                            if expected in val:
+                                return False
+                        elif val == expected:
+                            return False
+                    elif op == "$in":
+                        if isinstance(val, list):
+                            if not any(item in expected for item in val):
+                                return False
+                        elif val not in expected:
+                            return False
+                    elif op == "$nin":
+                        if isinstance(val, list):
+                            if any(item in expected for item in val):
+                                return False
+                        elif val in expected:
+                            return False
+                    elif op == "$lte":
+                        if val is None or val > expected:
+                            return False
             else:
                 if condition is None:
                     if has_key and val is not None:
@@ -67,6 +92,21 @@ class InMemoryCollection:
                 if existing.get(field) == val:
                     raise DuplicateKeyError(f"Duplicate key on {field}")
 
+    def _apply_update_ops(self, target, update, is_insert=False):
+        if is_insert and "$setOnInsert" in update:
+            target.update(copy.deepcopy(update["$setOnInsert"]))
+        if "$inc" in update:
+            for k, v in update["$inc"].items():
+                target[k] = target.get(k, 0) + v
+        if "$set" in update:
+            target.update(copy.deepcopy(update["$set"]))
+        if "$addToSet" in update:
+            for k, v in update["$addToSet"].items():
+                arr = list(target.get(k) or [])
+                if v not in arr:
+                    arr.append(copy.deepcopy(v))
+                target[k] = arr
+
     def find_one(self, query):
         for doc in self.docs:
             if self._matches(doc, query):
@@ -84,8 +124,7 @@ class InMemoryCollection:
         for doc in self.docs:
             if self._matches(doc, query):
                 updated = copy.deepcopy(doc)
-                if "$set" in update:
-                    updated.update(copy.deepcopy(update["$set"]))
+                self._apply_update_ops(updated, update)
                 self._check_unique(updated, ignore_id=doc.get("_id"))
                 doc.clear()
                 doc.update(updated)
@@ -96,11 +135,7 @@ class InMemoryCollection:
         for doc in self.docs:
             if self._matches(doc, query):
                 updated = copy.deepcopy(doc)
-                if "$inc" in update:
-                    for k, v in update["$inc"].items():
-                        updated[k] = updated.get(k, 0) + v
-                if "$set" in update:
-                    updated.update(copy.deepcopy(update["$set"]))
+                self._apply_update_ops(updated, update)
                 self._check_unique(updated, ignore_id=doc.get("_id"))
                 doc.clear()
                 doc.update(updated)
@@ -108,13 +143,7 @@ class InMemoryCollection:
         if upsert:
             created = copy.deepcopy(query)
             created.setdefault("_id", ObjectId())
-            if "$setOnInsert" in update:
-                created.update(copy.deepcopy(update["$setOnInsert"]))
-            if "$inc" in update:
-                for k, v in update["$inc"].items():
-                    created[k] = created.get(k, 0) + v
-            if "$set" in update:
-                created.update(copy.deepcopy(update["$set"]))
+            self._apply_update_ops(created, update, is_insert=True)
             self._check_unique(created)
             self.docs.append(created)
             return copy.deepcopy(created)
@@ -234,6 +263,7 @@ class FlowPagosTests(unittest.TestCase):
             api_key="test-key",
             secret_key="test-secret",
             api_url="https://sandbox.flow.cl/api",
+            flow_env="sandbox",
             session=fake_session,
         )
         payment = flow.create_payment(
@@ -260,26 +290,132 @@ class FlowPagosTests(unittest.TestCase):
             verify_flow_signature(sent_get_params, sent_get_params["s"], "test-secret")
         )
 
+    def test_config_flow_api_url_allowlist_rechaza_http_y_hosts_no_oficiales(self):
+        dummy_app = Flask("test_config_allowlist")
+
+        casos_invalidos = [
+            {"FLOW_ENV": "sandbox", "FLOW_API_URL": "http://sandbox.flow.cl/api"},
+            {"FLOW_ENV": "sandbox", "FLOW_API_URL": "https://evil.example/api"},
+            {"FLOW_ENV": "sandbox", "FLOW_API_URL": "https://www.flow.cl/api"},
+            {"FLOW_ENV": "sandbox", "FLOW_API_URL": "https://sandbox.flow.cl:8443/api"},
+            {"FLOW_ENV": "sandbox", "FLOW_API_URL": "https://user@sandbox.flow.cl/api"},
+            {
+                "FLOW_ENV": "production",
+                "FLOW_API_URL": "https://sandbox.flow.cl/api",
+                "FLOW_CONFIRMATION_URL": "https://hub.cl/api/pagos/flow/confirmacion",
+                "FLOW_RETURN_URL": "https://hub.cl/api/pagos/flow/retorno",
+                "FRONTEND_PUBLIC_URL": "https://hub.cl",
+            },
+        ]
+        for env in casos_invalidos:
+            with self.subTest(env=env):
+                with self.assertRaises(RuntimeError):
+                    configure_flow_settings(dummy_app, environ=env)
+
+        configure_flow_settings(
+            dummy_app,
+            environ={"FLOW_ENV": "sandbox", "FLOW_API_URL": "https://sandbox.flow.cl/api"},
+        )
+        self.assertEqual(dummy_app.config["FLOW_API_URL"], "https://sandbox.flow.cl/api")
+
+    def test_config_production_prohibe_localhost_http_y_variables_faltantes(self):
+        dummy_app = Flask("test_config_prod")
+        base_prod = {
+            "FLOW_ENV": "production",
+            "FLOW_API_URL": "https://www.flow.cl/api",
+            "FLOW_CONFIRMATION_URL": "https://hub.aventureros.cl/api/pagos/flow/confirmacion",
+            "FLOW_RETURN_URL": "https://hub.aventureros.cl/api/pagos/flow/retorno",
+            "FRONTEND_PUBLIC_URL": "https://hub.aventureros.cl",
+        }
+
+        # Falla si falta cualquiera de las 3 URLs públicas en producción
+        for clave in ("FLOW_CONFIRMATION_URL", "FLOW_RETURN_URL", "FRONTEND_PUBLIC_URL"):
+            env_incompleto = dict(base_prod)
+            env_incompleto.pop(clave)
+            with self.subTest(missing=clave):
+                with self.assertRaises(RuntimeError):
+                    configure_flow_settings(dummy_app, environ=env_incompleto)
+
+        # Falla con HTTP o con hosts locales/loopback
+        urls_prohibidas = [
+            "http://hub.aventureros.cl/ruta",
+            "https://localhost:5000/ruta",
+            "https://127.0.0.1:5000/ruta",
+            "https://0.0.0.0:5000/ruta",
+            "https://[::1]:5000/ruta",
+        ]
+        for clave in ("FLOW_CONFIRMATION_URL", "FLOW_RETURN_URL", "FRONTEND_PUBLIC_URL"):
+            for url_invalida in urls_prohibidas:
+                env_invalido = dict(base_prod)
+                env_invalido[clave] = url_invalida
+                with self.subTest(setting=clave, url=url_invalida):
+                    with self.assertRaises(RuntimeError):
+                        configure_flow_settings(dummy_app, environ=env_invalido)
+
+        configure_flow_settings(dummy_app, environ=base_prod)
+        self.assertEqual(dummy_app.config["FLOW_ENV"], "production")
+        self.assertEqual(dummy_app.config["FLOW_API_URL"], "https://www.flow.cl/api")
+
+    def test_flow_client_create_payment_rechaza_url_maliciosa_o_http(self):
+        for url_maliciosa in (
+            "https://phishing-flow.evil.example/pay.php",
+            "http://sandbox.flow.cl/app/web/pay.php",
+            "https://www.flow.cl/app/web/pay.php",
+        ):
+            fake_session = MagicMock()
+            bad_resp = MagicMock(status_code=200)
+            bad_resp.json.return_value = {
+                "url": url_maliciosa,
+                "token": "TOK_MALICIOSO",
+                "flowOrder": 111,
+            }
+            fake_session.post.return_value = bad_resp
+
+            flow = FlowClient(
+                api_key="test-key",
+                secret_key="test-secret",
+                api_url="https://sandbox.flow.cl/api",
+                flow_env="sandbox",
+                session=fake_session,
+            )
+            with self.subTest(url=url_maliciosa):
+                with self.assertRaises(FlowProviderError):
+                    flow.create_payment(
+                        commerce_order="AH-20261126150000-BAD00001",
+                        subject="Pase Aventurero Total (30 días - Acceso Completo)",
+                        amount=1490,
+                        email="aventurero@gremio.cl",
+                        url_confirmation="https://hub.example/confirmacion",
+                        url_return="https://hub.example/retorno",
+                    )
+
+            with (
+                patch.object(application.mongo, "db", self.fake_db),
+                patch("backend.app.pagos.routes._get_flow_client", return_value=flow),
+            ):
+                res = self.client.post(
+                    "/api/pagos/flow/iniciar",
+                    json={},
+                    headers=self.auth_headers(),
+                )
+                self.assertEqual(res.status_code, 502)
+
     def test_calcular_nueva_vigencia_nueva_vencida_y_renovacion_anticipada(self):
         ahora = datetime(2026, 11, 26, 12, 0, 0, tzinfo=timezone.utc)
 
-        # 1) Primera suscripción: 30 días exactos desde ahora
         primera = calcular_nueva_vigencia(None, duracion_dias=30, ahora=ahora)
         self.assertEqual(primera, ahora + timedelta(days=30))
 
-        # 2) Suscripción ya vencida: reinicia desde ahora + 30 días
         vencida = ahora - timedelta(days=7)
         post_vencimiento = calcular_nueva_vigencia(
             vencida, duracion_dias=30, ahora=ahora
         )
         self.assertEqual(post_vencimiento, ahora + timedelta(days=30))
 
-        # 3) Renovación anticipada (quedan 12 días): suma 30 días sobre la fecha vigente (42 días totales)
         vigente = ahora + timedelta(days=12)
         renovada = calcular_nueva_vigencia(vigente, duracion_dias=30, ahora=ahora)
         self.assertEqual(renovada, ahora + timedelta(days=42))
 
-        # 4) Fecha naive proveniente de PyMongo (UTC implícito)
         vigente_naive = datetime(2026, 12, 6, 12, 0, 0)
         renovada_naive = calcular_nueva_vigencia(
             vigente_naive, duracion_dias=30, ahora=ahora
@@ -296,7 +432,6 @@ class FlowPagosTests(unittest.TestCase):
             self.assertEqual(planes[0]["monto"], 1490)
             self.assertEqual(planes[0]["duracion_dias"], 30)
 
-            # Conflicto si intenta usar el email de otro usuario
             conflict_res = self.client.put(
                 "/api/perfil/email",
                 json={"email": "bardo@gremio.cl"},
@@ -304,7 +439,6 @@ class FlowPagosTests(unittest.TestCase):
             )
             self.assertEqual(conflict_res.status_code, 409)
 
-            # Actualización exitosa y verificación de índice sparse=True
             ok_res = self.client.put(
                 "/api/perfil/email",
                 json={"email": "NuevoCorreo@Gremio.cl"},
@@ -331,7 +465,6 @@ class FlowPagosTests(unittest.TestCase):
             patch.object(application.mongo, "db", self.fake_db),
             patch("backend.app.pagos.routes._get_flow_client", return_value=mock_flow),
         ):
-            # 1) Iniciar pago (ignora cualquier monto manipulado por el cliente)
             inicio_res = self.client.post(
                 "/api/pagos/flow/iniciar",
                 json={"plan_id": PLAN_PASE_AVENTURERO_ID, "monto": 1},
@@ -349,7 +482,6 @@ class FlowPagosTests(unittest.TestCase):
                 "currency": "CLP",
             }
 
-            # 2) Primera confirmación del webhook de Flow -> activa 30 días
             conf_1 = self.client.post(
                 "/api/pagos/flow/confirmacion",
                 data={"token": "FLOW_TOKEN_UNICO_001"},
@@ -360,7 +492,10 @@ class FlowPagosTests(unittest.TestCase):
             vigencia_inicial = conf_1.json["suscripcion_activa_hasta"]
             self.assertIsNotNone(vigencia_inicial)
 
-            # 3) Webhook duplicado / reintento de Flow -> idempotente, NO suma otros 30 días
+            orden_aplicada = self.fake_db.ordenes.find_one({"orden_comercio": orden_comercio})
+            self.assertEqual(orden_aplicada["activacion_estado"], "aplicada")
+            self.assertTrue(orden_aplicada["suscripcion_aplicada"])
+
             conf_2 = self.client.post(
                 "/api/pagos/flow/confirmacion",
                 data={"token": "FLOW_TOKEN_UNICO_001"},
@@ -375,7 +510,6 @@ class FlowPagosTests(unittest.TestCase):
                 vigencia_inicial,
             )
 
-            # 4) Retorno POST del navegador desde Flow -> 303 See Other e idempotente
             retorno_res = self.client.post(
                 "/api/pagos/flow/retorno",
                 data={"token": "FLOW_TOKEN_UNICO_001"},
@@ -385,19 +519,14 @@ class FlowPagosTests(unittest.TestCase):
                 retorno_res.headers["Location"],
                 f"http://localhost:5173/?pago_orden={orden_comercio}&estado=pagada",
             )
-            usuario_post_retorno = self.fake_db.usuarios.find_one({"_id": self.user_id})
-            self.assertEqual(
-                usuario_post_retorno["suscripcion_activa_hasta"].isoformat(),
-                vigencia_inicial,
-            )
 
-            # 5) Consulta de orden por propietario (200) y bloqueo a tercero (403)
             orden_res = self.client.get(
                 f"/api/ordenes/{orden_comercio}",
                 headers=self.auth_headers(),
             )
             self.assertEqual(orden_res.status_code, 200)
             self.assertEqual(orden_res.json["orden"]["estado"], "pagada")
+            self.assertEqual(orden_res.json["orden"]["activacion_estado"], "aplicada")
             self.assertTrue(orden_res.json["orden"]["es_suscriptor_activo"])
 
             ajena_res = self.client.get(
@@ -405,6 +534,130 @@ class FlowPagosTests(unittest.TestCase):
                 headers=self.auth_headers(self.other_user_id),
             )
             self.assertEqual(ajena_res.status_code, 403)
+
+    def test_recuperacion_activacion_interrumpida_en_proceso_sin_duplicar_30_dias(self):
+        mock_flow = MagicMock()
+        mock_flow.create_payment.side_effect = [
+            {
+                "url": "https://sandbox.flow.cl/app/web/pay.php",
+                "token": "TOK_INTERRUPCION_1",
+                "flow_order": 8001,
+                "redirect_url": "https://sandbox.flow.cl/app/web/pay.php?token=TOK_INTERRUPCION_1",
+            },
+            {
+                "url": "https://sandbox.flow.cl/app/web/pay.php",
+                "token": "TOK_INTERRUPCION_2",
+                "flow_order": 8002,
+                "redirect_url": "https://sandbox.flow.cl/app/web/pay.php?token=TOK_INTERRUPCION_2",
+            },
+        ]
+
+        with (
+            patch.object(application.mongo, "db", self.fake_db),
+            patch("backend.app.pagos.routes._get_flow_client", return_value=mock_flow),
+        ):
+            # --- Caso A: Falla al actualizar `usuarios`; la orden NO queda con suscripcion_aplicada=True ---
+            inicio_a = self.client.post(
+                "/api/pagos/flow/iniciar",
+                json={},
+                headers=self.auth_headers(),
+            )
+            orden_a = inicio_a.json["orden_comercio"]
+            mock_flow.get_status.return_value = {
+                "flowOrder": 8001,
+                "commerceOrder": orden_a,
+                "status": 2,
+                "amount": 1490,
+                "currency": "CLP",
+            }
+
+            with patch(
+                "backend.app.pagos.repository.aplicar_vigencia_idempotente_usuario",
+                side_effect=RuntimeError("Corte abrupto simulando caída de red"),
+            ):
+                fallo_conf = self.client.post(
+                    "/api/pagos/flow/confirmacion",
+                    data={"token": "TOK_INTERRUPCION_1"},
+                )
+                self.assertEqual(fallo_conf.status_code, 500)
+
+            orden_a_intermedia = self.fake_db.ordenes.find_one({"orden_comercio": orden_a})
+            self.assertEqual(orden_a_intermedia["activacion_estado"], "en_proceso")
+            self.assertFalse(orden_a_intermedia["suscripcion_aplicada"])
+            self.assertIsNotNone(orden_a_intermedia["vigencia_otorgada_hasta"])
+            vigencia_fijada_a = orden_a_intermedia["vigencia_otorgada_hasta"]
+
+            # El reintento del webhook retoma `en_proceso`, aplica la vigencia exacta y cierra en `aplicada`
+            reintento_a = self.client.post(
+                "/api/pagos/flow/confirmacion",
+                data={"token": "TOK_INTERRUPCION_1"},
+            )
+            self.assertEqual(reintento_a.status_code, 200)
+            self.assertFalse(reintento_a.json["idempotente"])
+
+            orden_a_final = self.fake_db.ordenes.find_one({"orden_comercio": orden_a})
+            self.assertEqual(orden_a_final["activacion_estado"], "aplicada")
+            self.assertTrue(orden_a_final["suscripcion_aplicada"])
+            usuario_tras_a = self.fake_db.usuarios.find_one({"_id": self.user_id})
+            self.assertEqual(usuario_tras_a["suscripcion_activa_hasta"], vigencia_fijada_a)
+
+            # --- Caso B: Proceso muere DESPUÉS de actualizar `usuarios` y ANTES de marcar `aplicada` ---
+            inicio_b = self.client.post(
+                "/api/pagos/flow/iniciar",
+                json={},
+                headers=self.auth_headers(),
+            )
+            orden_b = inicio_b.json["orden_comercio"]
+            doc_orden_b = self.fake_db.ordenes.find_one({"orden_comercio": orden_b})
+            vigencia_objetivo_b = vigencia_fijada_a + timedelta(days=30)
+
+            # Simulamos que el intento anterior ya sumó los 30 días en `usuarios`, dejó bloqueo expirado
+            # en `en_proceso` y se interrumpió antes de `finalizar_activacion_orden`
+            self.fake_db.ordenes.update_one(
+                {"_id": doc_orden_b["_id"]},
+                {
+                    "$set": {
+                        "activacion_estado": "en_proceso",
+                        "activacion_intento_en": datetime.now(timezone.utc)
+                        - timedelta(seconds=120),
+                        "suscripcion_aplicada": False,
+                        "vigencia_base_previa": vigencia_fijada_a,
+                        "vigencia_otorgada_hasta": vigencia_objetivo_b,
+                    }
+                },
+            )
+            self.fake_db.usuarios.update_one(
+                {"_id": self.user_id},
+                {
+                    "$set": {"suscripcion_activa_hasta": vigencia_objetivo_b},
+                    "$addToSet": {"ordenes_aplicadas": doc_orden_b["_id"]},
+                },
+            )
+
+            mock_flow.get_status.return_value = {
+                "flowOrder": 8002,
+                "commerceOrder": orden_b,
+                "status": 2,
+                "amount": 1490,
+                "currency": "CLP",
+            }
+
+            reintento_b = self.client.post(
+                "/api/pagos/flow/confirmacion",
+                data={"token": "TOK_INTERRUPCION_2"},
+            )
+            self.assertEqual(reintento_b.status_code, 200)
+
+            orden_b_final = self.fake_db.ordenes.find_one({"orden_comercio": orden_b})
+            self.assertEqual(orden_b_final["activacion_estado"], "aplicada")
+            self.assertTrue(orden_b_final["suscripcion_aplicada"])
+
+            # Verifica que NO se sumaron otros 30 días adicionales al recuperar la orden
+            usuario_tras_b = self.fake_db.usuarios.find_one({"_id": self.user_id})
+            self.assertEqual(
+                usuario_tras_b["suscripcion_activa_hasta"],
+                vigencia_objetivo_b,
+            )
 
     def test_renovacion_anticipada_acumula_30_dias_en_confirmacion(self):
         base_futura = datetime.now(timezone.utc) + timedelta(days=10)

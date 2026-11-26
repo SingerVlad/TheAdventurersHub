@@ -11,6 +11,7 @@ from backend.app.pagos import catalog
 from backend.app.pagos.repository import buscar_orden_por_token
 from backend.app.pagos.service import (
     AccesoOrdenDenegadoError,
+    ActivacionEnProcesoError,
     IntegridadPagoError,
     OrdenNoEncontradaError,
     PagoValidationError,
@@ -93,6 +94,8 @@ def confirmar_pago_flow():
     except IntegridadPagoError:
         current_app.logger.warning("Discrepancia de integridad en confirmación Flow")
         return jsonify({"error": "Validación de pago rechazada"}), 400
+    except ActivacionEnProcesoError:
+        return jsonify({"error": "La activación de la orden está en proceso"}), 409
     except FlowConfigurationError:
         return jsonify({"error": "La pasarela de pagos no está configurada"}), 503
     except FlowProviderError:
@@ -126,7 +129,7 @@ def retorno_pago_flow():
             estado=resultado["estado"],
         )
         return redirect(destino, code=303)
-    except (FlowConfigurationError, FlowProviderError):
+    except (FlowConfigurationError, FlowProviderError, ActivacionEnProcesoError):
         orden = buscar_orden_por_token(token_limpio)
         if orden:
             destino = construir_url_retorno_frontend(

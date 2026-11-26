@@ -37,6 +37,10 @@ class IntegridadPagoError(Exception):
     """Los datos devueltos por la pasarela no coinciden con la orden registrada."""
 
 
+class ActivacionEnProcesoError(Exception):
+    """Otra solicitud concurrente está procesando activamente la orden."""
+
+
 def calcular_nueva_vigencia(vigencia_actual, duracion_dias=30, ahora=None):
     """
     Calcula la fecha exacta de expiración sumando `duracion_dias`.
@@ -113,7 +117,10 @@ def iniciar_pago_suscripcion(usuario_actual, datos, flow_client, config, ahora=N
         "moneda": plan["moneda"],
         "duracion_dias": plan["duracion_dias"],
         "estado": "pendiente",
+        "activacion_estado": "pendiente",
+        "activacion_intento_en": None,
         "suscripcion_aplicada": False,
+        "vigencia_base_previa": None,
         "flow_token": None,
         "flow_orden": None,
         "flow_status": 1,
@@ -176,6 +183,87 @@ def _extraer_monto_entero(valor):
         raise IntegridadPagoError("El monto informado por Flow no es válido.") from error
 
 
+def _ejecutar_activacion_recuperable(orden, flow_orden, ahora_utc):
+    orden_en_proceso = repository.adquirir_orden_para_activacion(
+        orden["_id"],
+        flow_orden=flow_orden,
+        ahora=ahora_utc,
+    )
+    if orden_en_proceso is None:
+        orden_actual = repository.buscar_orden_por_comercio(orden["orden_comercio"]) or orden
+        if (
+            orden_actual.get("suscripcion_aplicada") is True
+            or orden_actual.get("activacion_estado") == "aplicada"
+        ):
+            return (
+                "pagada",
+                True,
+                normalize_utc_datetime(orden_actual.get("vigencia_otorgada_hasta")),
+            )
+        raise ActivacionEnProcesoError(
+            "La activación de esta orden ya se encuentra en ejecución."
+        )
+
+    duracion_dias = int(orden_en_proceso.get("duracion_dias", 30))
+    fecha_pago = normalize_utc_datetime(orden_en_proceso.get("fecha_pago")) or ahora_utc
+    vigencia_objetivo = normalize_utc_datetime(
+        orden_en_proceso.get("vigencia_otorgada_hasta")
+    )
+    vigencia_base_previa = normalize_utc_datetime(
+        orden_en_proceso.get("vigencia_base_previa")
+    )
+
+    try:
+        if vigencia_objetivo is None:
+            usuario = obtener_usuario_por_id(orden_en_proceso["usuario_id"])
+            if not usuario:
+                raise LookupError("El usuario asociado a la orden no existe.")
+            vigencia_base_previa = normalize_utc_datetime(
+                usuario.get("suscripcion_activa_hasta")
+            )
+            vigencia_calculada = calcular_nueva_vigencia(
+                vigencia_base_previa,
+                duracion_dias=duracion_dias,
+                ahora=fecha_pago,
+            )
+            orden_fijada = repository.fijar_vigencia_objetivo_en_orden(
+                orden_en_proceso["_id"],
+                vigencia_objetivo=vigencia_calculada,
+                vigencia_base_previa=vigencia_base_previa,
+                fecha_pago=fecha_pago,
+                ahora=ahora_utc,
+            )
+            vigencia_objetivo = normalize_utc_datetime(
+                orden_fijada.get("vigencia_otorgada_hasta")
+            )
+            vigencia_base_previa = normalize_utc_datetime(
+                orden_fijada.get("vigencia_base_previa")
+            )
+
+        vigencia_aplicada = repository.aplicar_vigencia_idempotente_usuario(
+            usuario_id=orden_en_proceso["usuario_id"],
+            orden_id=orden_en_proceso["_id"],
+            vigencia_objetivo=vigencia_objetivo,
+            vigencia_base_previa=vigencia_base_previa,
+            duracion_dias=duracion_dias,
+            ahora=fecha_pago,
+            calcular_vigencia_fn=calcular_nueva_vigencia,
+        )
+        repository.finalizar_activacion_orden(
+            orden_en_proceso["_id"],
+            vigencia_hasta=vigencia_aplicada,
+            flow_orden=flow_orden,
+            fecha_pago=fecha_pago,
+            fecha_actualizacion=ahora_utc,
+        )
+        return "pagada", False, vigencia_aplicada
+    except Exception:
+        repository.liberar_intento_activacion_en_proceso(
+            orden_en_proceso["_id"], ahora_utc
+        )
+        raise
+
+
 def procesar_confirmacion_flow(raw_token, flow_client, origen="confirmacion", ahora=None):
     token = validar_token_flow(raw_token)
     ahora_utc = normalize_utc_datetime(ahora) or datetime.now(timezone.utc)
@@ -217,33 +305,11 @@ def procesar_confirmacion_flow(raw_token, flow_client, origen="confirmacion", ah
     vigencia_hasta = normalize_utc_datetime(orden.get("vigencia_otorgada_hasta"))
 
     if flow_status == 2:
-        orden_reclamada = repository.reclamar_orden_para_activacion(
-            orden["_id"],
+        estado_final, idempotente, vigencia_hasta = _ejecutar_activacion_recuperable(
+            orden,
             flow_orden=flow_orden,
-            fecha_pago=ahora_utc,
+            ahora_utc=ahora_utc,
         )
-        if orden_reclamada is not None:
-            try:
-                vigencia_hasta = repository.extender_suscripcion_usuario(
-                    orden["usuario_id"],
-                    duracion_dias=int(orden.get("duracion_dias", 30)),
-                    ahora=ahora_utc,
-                    calcular_vigencia_fn=calcular_nueva_vigencia,
-                )
-            except Exception:
-                repository.revertir_reclamo_activacion(orden["_id"], ahora_utc)
-                raise
-            repository.guardar_vigencia_otorgada_en_orden(
-                orden["_id"], vigencia_hasta, ahora_utc
-            )
-            estado_final = "pagada"
-        else:
-            idempotente = True
-            orden_actual = repository.buscar_orden_por_comercio(orden["orden_comercio"]) or orden
-            vigencia_hasta = normalize_utc_datetime(
-                orden_actual.get("vigencia_otorgada_hasta")
-            )
-            estado_final = "pagada"
     else:
         orden_actualizada = repository.actualizar_estado_no_pagado(
             orden["_id"],
@@ -254,7 +320,8 @@ def procesar_confirmacion_flow(raw_token, flow_client, origen="confirmacion", ah
         )
         if orden_actualizada is None:
             idempotente = True
-            estado_final = "pagada"
+            orden_actual = repository.buscar_orden_por_comercio(orden["orden_comercio"]) or orden
+            estado_final = orden_actual.get("estado", "pagada")
         else:
             estado_final = estado_mapeado
 
@@ -330,6 +397,7 @@ def obtener_detalle_orden_usuario(usuario_actual, orden_comercio):
         "moneda": orden["moneda"],
         "duracion_dias": orden.get("duracion_dias", 30),
         "estado": orden["estado"],
+        "activacion_estado": orden.get("activacion_estado", "pendiente"),
         "flow_orden": orden.get("flow_orden"),
         "fecha_creacion": fecha_creacion.isoformat() if fecha_creacion else None,
         "fecha_pago": fecha_pago.isoformat() if fecha_pago else None,
