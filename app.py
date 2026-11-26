@@ -547,7 +547,7 @@ def guardar_asset(usuario_actual):
         "usuario_id": usuario_actual['_id'], # Usamos el ObjectId del usuario logueado
         "tipo": tipo,
         "prompt_original": contenido,
-        "estado_aprobacion": 'Aprobado',
+        "estado_aprobacion": "Pendiente" if campana_object_id else "Aprobado",
         "campana_id": campana_object_id,
         "fecha_creacion": datetime.now() # Siempre es bueno tener la fecha en Mongo
     }
@@ -667,6 +667,32 @@ def eliminar_asset(usuario_actual, asset_id):
         return jsonify({"error": "No se pudo eliminar el asset"}), 500
 
 
+@app.route('/api/assets/<asset_id>/moderacion', methods=['POST'])
+@token_required
+def moderar_asset(usuario_actual, asset_id):
+    datos = request.get_json(silent=True)
+    estado = datos.get("estado_aprobacion") if isinstance(datos, dict) else None
+    if estado not in ("Aprobado", "Rechazado"):
+        return jsonify({"error": "El estado debe ser Aprobado o Rechazado"}), 400
+
+    asset_object_id = parse_object_id(asset_id)
+    asset = mongo.db.assets.find_one({"_id": asset_object_id}) if asset_object_id else None
+    if not asset or not asset.get("campana_id"):
+        return jsonify({"error": "Recurso de campaña no encontrado"}), 404
+
+    _, es_dm, _ = get_campaign_access(str(asset["campana_id"]), usuario_actual["_id"])
+    if not es_dm:
+        return jsonify({"error": "Solo el DM puede moderar recursos de esta campaña"}), 403
+
+    result = mongo.db.assets.update_one(
+        {"_id": asset_object_id, "campana_id": asset["campana_id"]},
+        {"$set": {"estado_aprobacion": estado}},
+    )
+    if not result.matched_count:
+        return jsonify({"error": "Recurso de campaña no encontrado"}), 404
+    return jsonify({"estado_aprobacion": estado}), 200
+
+
 @app.route('/api/assets/<asset_id>/file', methods=['GET'])
 @token_required
 def servir_asset(usuario_actual, asset_id):
@@ -680,7 +706,7 @@ def servir_asset(usuario_actual, asset_id):
 
     if asset.get("campana_id"):
         _, es_dm, es_jugador = get_campaign_access(str(asset["campana_id"]), usuario_actual["_id"])
-        autorizado = es_dm or es_jugador
+        autorizado = es_dm or (es_jugador and asset.get("estado_aprobacion") == "Aprobado")
     else:
         autorizado = asset.get("usuario_id") == usuario_actual["_id"]
     if not autorizado:
@@ -829,7 +855,7 @@ def confirmar_guardado_imagen(usuario_actual):
             "file_path": relative_path.as_posix(),
             "nombre": nombre_npc,
             "prompt_original": str(datos.get("prompt_usado", ""))[:2000],
-            "estado_aprobacion": "Aprobado",
+            "estado_aprobacion": "Pendiente" if campana_object_id else "Aprobado",
             "fecha_creacion": datetime.now(timezone.utc),
             "campana_id": campana_object_id,
         }
@@ -927,15 +953,21 @@ def obtener_detalle_campana(usuario_actual, campana_id):
 
         # 5. Obtener Assets vinculados a esta campaña
         # (Filtramos por campana_id en la colección de assets)
-        assets_cursor = mongo.db.assets.find({"campana_id": campana_object_id})
+        filtro_assets = {"campana_id": campana_object_id}
+        if not es_dm:
+            filtro_assets["estado_aprobacion"] = "Aprobado"
+        assets_cursor = mongo.db.assets.find(filtro_assets)
         lista_assets = []
         for a in assets_cursor:
             # Reutilizamos la lógica de limpieza de nombres que hicimos antes
-            nombre_limpio = a.get('nombre', 'Asset sin nombre')
+            contenido = a.get('prompt_original')
+            nombre_npc = contenido.get('nombre') if isinstance(contenido, dict) else None
+            nombre_limpio = a.get('nombre') or nombre_npc or 'Recurso sin nombre'
             lista_assets.append({
                 "id": str(a['_id']),
                 "tipo": a.get('tipo'),
                 "nombre": nombre_limpio,
+                "estado_aprobacion": a.get("estado_aprobacion", "Pendiente"),
                 "url": f"/assets/{a['_id']}/file" if a.get('file_path') else None
             })
 
