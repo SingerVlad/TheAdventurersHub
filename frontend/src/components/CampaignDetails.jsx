@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
-import { Users, Crown, ChevronLeft, Map, UserCircle, Hash } from 'lucide-react';
+import { Users, Crown, ChevronLeft, Map, UserCircle } from 'lucide-react';
 import ProtectedAssetImage from './ProtectedAssetImage';
 
 export default function CampaignDetails({ campanaId, onBack }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [moderando, setModerando] = useState(false);
+  const [errorModeracion, setErrorModeracion] = useState('');
 
   useEffect(() => {
     const fetchDetail = async () => {
@@ -21,6 +23,26 @@ export default function CampaignDetails({ campanaId, onBack }) {
     };
     fetchDetail();
   }, [campanaId, onBack]);
+
+  const moderarRecurso = async (id, estado) => {
+    setModerando(true);
+    setErrorModeracion('');
+    try {
+      const { data: resultado } = await api.post(`/assets/${id}/moderacion`, {
+        estado_aprobacion: estado,
+      });
+      setData(campana => ({
+        ...campana,
+        assets: campana.assets.map(asset => asset.id === id
+          ? { ...asset, estado_aprobacion: resultado.estado_aprobacion }
+          : asset),
+      }));
+    } catch {
+      setErrorModeracion('No se pudo actualizar el estado. Intenta de nuevo.');
+    } finally {
+      setModerando(false);
+    }
+  };
 
   if (loading) return <div className="p-20 text-center animate-pulse text-fantasy-gold">Consultando los oráculos...</div>;
 
@@ -73,23 +95,43 @@ export default function CampaignDetails({ campanaId, onBack }) {
               <Map size={20} /> Recursos de la Partida
             </h3>
             
+            {errorModeracion && <p role="alert" className="mb-4 text-red-300">{errorModeracion}</p>}
             {data.assets.length === 0 ? (
               <div className="text-center py-20 border-2 border-dashed border-gray-800 rounded-xl">
                 <p className="text-gray-600 italic">No hay mapas ni retratos asignados a esta campaña todavía.</p>
               </div>
             ) : (
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
                 {data.assets.map(a => (
-                  <div key={a.id} className="group relative aspect-square bg-black rounded-lg overflow-hidden border border-fantasy-wood/50 hover:border-fantasy-gold transition-all">
-                    {a.url ? (
-                      <ProtectedAssetImage assetId={a.id} alt={a.nombre} className="w-full h-full object-cover opacity-60 group-hover:opacity-100 transition-opacity" />
-                    ) : (
-                      <div className="flex items-center justify-center h-full opacity-20"><UserCircle size={40} /></div>
-                    )}
-                    <div className="absolute bottom-0 left-0 right-0 p-2 bg-black/80 text-[10px] text-white font-bold uppercase truncate">
-                      {a.nombre}
+                  <article key={a.id} className="bg-black rounded-lg overflow-hidden border border-fantasy-wood/50">
+                    <div className="aspect-square">
+                      {a.url ? (
+                        <ProtectedAssetImage assetId={a.id} alt={a.nombre} className="w-full h-full object-cover" />
+                      ) : (
+                        <div className="flex items-center justify-center h-full opacity-20"><UserCircle size={40} /></div>
+                      )}
                     </div>
-                  </div>
+                    <div className="space-y-2 p-3">
+                      <p className="text-sm font-bold text-white break-words">{a.nombre}</p>
+                      {data.soy_el_dm && (
+                        <>
+                          <p aria-live="polite" className="text-sm text-fantasy-paper">{a.estado_aprobacion}</p>
+                          <div className="flex flex-wrap gap-2">
+                            <button type="button" disabled={moderando || a.estado_aprobacion === 'Aprobado'}
+                              onClick={() => moderarRecurso(a.id, 'Aprobado')}
+                              className="rounded bg-green-900 px-2 py-1 text-white disabled:opacity-50">
+                              Aprobar
+                            </button>
+                            <button type="button" disabled={moderando || a.estado_aprobacion === 'Rechazado'}
+                              onClick={() => moderarRecurso(a.id, 'Rechazado')}
+                              className="rounded bg-red-900 px-2 py-1 text-white disabled:opacity-50">
+                              Rechazar
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </article>
                 ))}
               </div>
             )}
