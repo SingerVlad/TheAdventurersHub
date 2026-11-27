@@ -1,6 +1,6 @@
 from flask import Blueprint, current_app, jsonify, request
 
-from backend.app.auth.repository import EmailConflictError
+from backend.app.auth.repository import EmailConflictError, obtener_usuario_por_id
 from backend.app.auth.service import (
     AuthValidationError,
     guardar_email_usuario,
@@ -8,19 +8,37 @@ from backend.app.auth.service import (
     serializar_perfil_usuario,
 )
 from backend.app.extensions import rate_limit, token_required
+from backend.app.pagos import routes as pagos_routes
+from backend.app.pagos.service import reconciliar_ordenes_pendientes
 
 auth_bp = Blueprint("auth", __name__)
+
+
+def _refrescar_usuario_reconciliado(usuario_actual):
+    try:
+        reconciliadas = reconciliar_ordenes_pendientes(
+            flow_client=pagos_routes._get_flow_client(),
+            usuario_id=usuario_actual["_id"],
+        )
+        if reconciliadas:
+            return obtener_usuario_por_id(usuario_actual["_id"]) or usuario_actual
+    except Exception:
+        current_app.logger.warning(
+            "No se pudo completar la reconciliación automática al consultar perfil"
+        )
+    return usuario_actual
 
 
 @auth_bp.route("/api/perfil", methods=["GET"])
 @token_required
 def obtener_perfil(usuario_actual):
+    usuario_vigente = _refrescar_usuario_reconciliado(usuario_actual)
     return (
         jsonify(
             {
                 "status": "success",
-                "mensaje": f"Hola {usuario_actual['username']}.",
-                "datos_usuario": serializar_perfil_usuario(usuario_actual),
+                "mensaje": f"Hola {usuario_vigente['username']}.",
+                "datos_usuario": serializar_perfil_usuario(usuario_vigente),
             }
         ),
         200,
@@ -30,12 +48,13 @@ def obtener_perfil(usuario_actual):
 @auth_bp.route("/api/perfil/suscripcion", methods=["GET"])
 @token_required
 def consultar_suscripcion(usuario_actual):
-    estado = obtener_estado_suscripcion(usuario_actual)
+    usuario_vigente = _refrescar_usuario_reconciliado(usuario_actual)
+    estado = obtener_estado_suscripcion(usuario_vigente)
     return (
         jsonify(
             {
                 "status": "success",
-                "email": usuario_actual.get("email"),
+                "email": usuario_vigente.get("email"),
                 **estado,
             }
         ),

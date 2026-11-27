@@ -11,7 +11,6 @@ from backend.app.pagos import catalog
 from backend.app.pagos.repository import buscar_orden_por_token
 from backend.app.pagos.service import (
     AccesoOrdenDenegadoError,
-    ActivacionEnProcesoError,
     IntegridadPagoError,
     OrdenNoEncontradaError,
     PagoValidationError,
@@ -94,8 +93,6 @@ def confirmar_pago_flow():
     except IntegridadPagoError:
         current_app.logger.warning("Discrepancia de integridad en confirmación Flow")
         return jsonify({"error": "Validación de pago rechazada"}), 400
-    except ActivacionEnProcesoError:
-        return jsonify({"error": "La activación de la orden está en proceso"}), 409
     except FlowConfigurationError:
         return jsonify({"error": "La pasarela de pagos no está configurada"}), 503
     except FlowProviderError:
@@ -129,13 +126,18 @@ def retorno_pago_flow():
             estado=resultado["estado"],
         )
         return redirect(destino, code=303)
-    except (FlowConfigurationError, FlowProviderError, ActivacionEnProcesoError):
+    except (FlowConfigurationError, FlowProviderError):
         orden = buscar_orden_por_token(token_limpio)
         if orden:
+            estado_actual = (
+                "pagada"
+                if orden.get("suscripcion_aplicada")
+                else orden.get("estado", "pendiente")
+            )
             destino = construir_url_retorno_frontend(
                 frontend_url,
                 orden_comercio=orden["orden_comercio"],
-                estado=orden.get("estado", "pendiente"),
+                estado=estado_actual,
             )
             return redirect(destino, code=303)
         destino = construir_url_retorno_frontend(
@@ -157,7 +159,11 @@ def retorno_pago_flow():
 @token_required
 def consultar_orden(usuario_actual, orden_comercio):
     try:
-        detalle = obtener_detalle_orden_usuario(usuario_actual, orden_comercio)
+        detalle = obtener_detalle_orden_usuario(
+            usuario_actual,
+            orden_comercio,
+            flow_client=_get_flow_client(),
+        )
         return jsonify({"status": "success", "orden": detalle}), 200
     except OrdenNoEncontradaError:
         return jsonify({"error": "Orden no encontrada"}), 404

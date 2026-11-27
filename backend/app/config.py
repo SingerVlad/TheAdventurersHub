@@ -13,14 +13,22 @@ DEFAULT_FLOW_API_URLS = {
 ALLOWED_FLOW_ENVS = set(OFFICIAL_FLOW_HOSTS.keys())
 FORBIDDEN_PRODUCTION_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
+DEFAULT_FLOW_HTTP_TIMEOUT_SECONDS = 8.0
+MAX_FLOW_HTTP_TIMEOUT_SECONDS = 10.0
+
 
 def _is_forbidden_local_host(hostname):
+    """
+    Verifica si un host es inválido para URLs públicas en producción.
+    Si es una dirección IP literal, exige estrictamente `ip.is_global == True`
+    (rechazando privadas RFC1918, loopback, link-local, CGNAT y reservadas).
+    """
     host = (hostname or "").strip().lower()
     if not host or host in FORBIDDEN_PRODUCTION_HOSTS or host.endswith(".localhost"):
         return True
     try:
         ip = ipaddress.ip_address(host)
-        return ip.is_loopback or ip.is_unspecified
+        return not ip.is_global
     except ValueError:
         return False
 
@@ -66,9 +74,23 @@ def _validate_production_public_url(setting_name, raw_url):
         or parsed.password
     ):
         raise RuntimeError(
-            f"{setting_name} debe usar https:// y un dominio público válido (no localhost/loopback) en producción."
+            f"{setting_name} debe usar https:// y un host público global válido en producción."
         )
     return cleaned
+
+
+def _parse_flow_timeout(raw_value):
+    if raw_value is None or str(raw_value).strip() == "":
+        return DEFAULT_FLOW_HTTP_TIMEOUT_SECONDS
+    try:
+        timeout = float(str(raw_value).strip())
+    except ValueError as error:
+        raise RuntimeError("FLOW_HTTP_TIMEOUT_SECONDS debe ser un número válido.") from error
+    if not (0.5 <= timeout <= MAX_FLOW_HTTP_TIMEOUT_SECONDS):
+        raise RuntimeError(
+            f"FLOW_HTTP_TIMEOUT_SECONDS debe estar entre 0.5 y {MAX_FLOW_HTTP_TIMEOUT_SECONDS} segundos."
+        )
+    return timeout
 
 
 def configure_flow_settings(app, environ=None):
@@ -88,6 +110,8 @@ def configure_flow_settings(app, environ=None):
         ).rstrip("/")
     except ValueError as error:
         raise RuntimeError(str(error)) from error
+
+    flow_timeout = _parse_flow_timeout(env.get("FLOW_HTTP_TIMEOUT_SECONDS"))
 
     if flow_env == "production":
         confirmation_url = _validate_production_public_url(
@@ -127,6 +151,7 @@ def configure_flow_settings(app, environ=None):
     app.config["FLOW_API_URL"] = flow_api_url
     app.config["FLOW_API_KEY"] = str(env.get("FLOW_API_KEY", "")).strip()
     app.config["FLOW_SECRET_KEY"] = str(env.get("FLOW_SECRET_KEY", "")).strip()
+    app.config["FLOW_HTTP_TIMEOUT_SECONDS"] = flow_timeout
     app.config["FLOW_CONFIRMATION_URL"] = confirmation_url
     app.config["FLOW_RETURN_URL"] = return_url
     app.config["FRONTEND_PUBLIC_URL"] = frontend_public_url

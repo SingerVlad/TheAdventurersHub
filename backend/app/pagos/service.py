@@ -10,6 +10,11 @@ from backend.app.auth.service import (
     normalize_utc_datetime,
     obtener_estado_suscripcion,
 )
+from backend.app.integrations.flow_client import (
+    FlowConfigurationError,
+    FlowProviderError,
+    FlowTimeoutError,
+)
 from backend.app.pagos import catalog, repository
 
 ORDEN_COMERCIO_PATTERN = re.compile(r"^AH-\d{14}-[A-F0-9]{8}$")
@@ -35,10 +40,6 @@ class AccesoOrdenDenegadoError(Exception):
 
 class IntegridadPagoError(Exception):
     """Los datos devueltos por la pasarela no coinciden con la orden registrada."""
-
-
-class ActivacionEnProcesoError(Exception):
-    """Otra solicitud concurrente está procesando activamente la orden."""
 
 
 def calcular_nueva_vigencia(vigencia_actual, duracion_dias=30, ahora=None):
@@ -79,6 +80,13 @@ def iniciar_pago_suscripcion(usuario_actual, datos, flow_client, config, ahora=N
     if not isinstance(datos, dict):
         raise PagoValidationError("El cuerpo debe ser un objeto JSON.")
 
+    ahora_utc = normalize_utc_datetime(ahora) or datetime.now(timezone.utc)
+    reconciliar_ordenes_pendientes(
+        flow_client=flow_client,
+        usuario_id=usuario_actual["_id"],
+        ahora=ahora_utc,
+    )
+
     plan = catalog.obtener_plan(datos.get("plan_id"))
     if not plan:
         raise PagoValidationError("Plan de suscripción no válido.")
@@ -96,7 +104,6 @@ def iniciar_pago_suscripcion(usuario_actual, datos, flow_client, config, ahora=N
             "Debes registrar un correo electrónico antes de iniciar el pago."
         )
 
-    ahora_utc = normalize_utc_datetime(ahora) or datetime.now(timezone.utc)
     orden_comercio = generar_orden_comercio(ahora_utc)
 
     documento_orden = {
@@ -119,9 +126,12 @@ def iniciar_pago_suscripcion(usuario_actual, datos, flow_client, config, ahora=N
         "estado": "pendiente",
         "activacion_estado": "pendiente",
         "activacion_intento_en": None,
+        "confirmacion_recibida_en": None,
+        "requiere_reconciliacion": False,
         "suscripcion_aplicada": False,
         "vigencia_base_previa": None,
         "flow_token": None,
+        "ultimo_token_flow": None,
         "flow_orden": None,
         "flow_status": 1,
         "vigencia_otorgada_hasta": None,
@@ -183,6 +193,12 @@ def _extraer_monto_entero(valor):
         raise IntegridadPagoError("El monto informado por Flow no es válido.") from error
 
 
+def _consultar_estado_flow(flow_client, token):
+    if hasattr(flow_client, "get_status"):
+        return flow_client.get_status(token)
+    return flow_client.get_payment_status(token)
+
+
 def _ejecutar_activacion_recuperable(orden, flow_orden, ahora_utc):
     orden_en_proceso = repository.adquirir_orden_para_activacion(
         orden["_id"],
@@ -200,8 +216,13 @@ def _ejecutar_activacion_recuperable(orden, flow_orden, ahora_utc):
                 True,
                 normalize_utc_datetime(orden_actual.get("vigencia_otorgada_hasta")),
             )
-        raise ActivacionEnProcesoError(
-            "La activación de esta orden ya se encuentra en ejecución."
+        # Otra ejecución concurrente tiene el bloqueo activo; la recepción del token
+        # ya quedó persistida de forma duradera con `requiere_reconciliacion=True`,
+        # por lo que respondemos de forma idempotente sin HTTP 409.
+        return (
+            "en_proceso",
+            True,
+            normalize_utc_datetime(orden_actual.get("vigencia_otorgada_hasta")),
         )
 
     duracion_dias = int(orden_en_proceso.get("duracion_dias", 30))
@@ -268,14 +289,74 @@ def procesar_confirmacion_flow(raw_token, flow_client, origen="confirmacion", ah
     token = validar_token_flow(raw_token)
     ahora_utc = normalize_utc_datetime(ahora) or datetime.now(timezone.utc)
 
-    status_data = flow_client.get_status(token)
-    commerce_order = str(status_data.get("commerceOrder", "")).strip()
+    # 1. Persistir de forma duradera la recepción del token antes de consultar Flow o reclamar bloqueo
+    orden_conocida = repository.buscar_orden_por_token(token)
+    if orden_conocida is not None:
+        orden_conocida = repository.persistir_recepcion_confirmacion(
+            orden_conocida["_id"], token, ahora_utc
+        )
 
-    orden = repository.buscar_orden_por_token(token)
+    # 2. Consultar estado autoritativo en Flow con timeout acotado (< 15s)
+    try:
+        status_data = _consultar_estado_flow(flow_client, token)
+    except FlowTimeoutError:
+        if origen == "confirmacion":
+            repository.registrar_transaccion_pago(
+                {
+                    "orden_id": orden_conocida["_id"] if orden_conocida else None,
+                    "orden_comercio": (
+                        orden_conocida["orden_comercio"] if orden_conocida else None
+                    ),
+                    "flow_token": token,
+                    "flow_orden": (
+                        orden_conocida.get("flow_orden") if orden_conocida else None
+                    ),
+                    "tipo_evento": "confirmacion_timeout",
+                    "estado_flow": None,
+                    "estado_orden": (
+                        orden_conocida.get("estado", "pendiente")
+                        if orden_conocida
+                        else "en_reconciliacion"
+                    ),
+                    "idempotente": True,
+                    "requiere_reconciliacion": True,
+                    "fecha_evento": ahora_utc,
+                }
+            )
+            vigencia_previa = (
+                normalize_utc_datetime(orden_conocida.get("vigencia_otorgada_hasta"))
+                if orden_conocida
+                else None
+            )
+            return {
+                "ok": True,
+                "orden_comercio": (
+                    orden_conocida["orden_comercio"] if orden_conocida else None
+                ),
+                "estado": (
+                    "pagada"
+                    if (orden_conocida and orden_conocida.get("suscripcion_aplicada"))
+                    else "en_reconciliacion"
+                ),
+                "flow_status": None,
+                "idempotente": True,
+                "reconciliacion_pendiente": not bool(
+                    orden_conocida and orden_conocida.get("suscripcion_aplicada")
+                ),
+                "suscripcion_activa_hasta": (
+                    vigencia_previa.isoformat() if vigencia_previa else None
+                ),
+            }
+        raise
+
+    commerce_order = str(status_data.get("commerceOrder", "")).strip()
+    orden = orden_conocida
     if not orden and commerce_order:
         candidata = repository.buscar_orden_por_comercio(commerce_order)
         if candidata and candidata.get("flow_token") in {None, token}:
-            orden = candidata
+            orden = repository.persistir_recepcion_confirmacion(
+                candidata["_id"], token, ahora_utc
+            )
 
     if not orden:
         raise OrdenNoEncontradaError("No existe una orden asociada al token recibido.")
@@ -321,7 +402,11 @@ def procesar_confirmacion_flow(raw_token, flow_client, origen="confirmacion", ah
         if orden_actualizada is None:
             idempotente = True
             orden_actual = repository.buscar_orden_por_comercio(orden["orden_comercio"]) or orden
-            estado_final = orden_actual.get("estado", "pagada")
+            estado_final = (
+                "pagada"
+                if orden_actual.get("suscripcion_aplicada")
+                else orden_actual.get("activacion_estado", orden_actual.get("estado", "pendiente"))
+            )
         else:
             estado_final = estado_mapeado
 
@@ -346,12 +431,71 @@ def procesar_confirmacion_flow(raw_token, flow_client, origen="confirmacion", ah
     )
 
     return {
+        "ok": True,
         "orden_comercio": orden["orden_comercio"],
         "estado": estado_final,
         "flow_status": flow_status,
         "idempotente": idempotente,
         "suscripcion_activa_hasta": vigencia_hasta.isoformat() if vigencia_hasta else None,
     }
+
+
+def reconciliar_ordenes_pendientes(
+    flow_client,
+    usuario_id=None,
+    orden_comercio=None,
+    ahora=None,
+    limite=5,
+):
+    """
+    Recupera automáticamente órdenes pendientes con `requiere_reconciliacion=True` o
+    bloqueos `"en_proceso"` expirados sin bloquear la lectura en caso de fallo externo.
+    """
+    ahora_utc = normalize_utc_datetime(ahora) or datetime.now(timezone.utc)
+    pendientes = repository.buscar_ordenes_reconciliables(
+        usuario_id=usuario_id,
+        orden_comercio=orden_comercio,
+        ahora=ahora_utc,
+        limite=limite,
+    )
+    reconciliadas = []
+    for orden in pendientes:
+        token = orden.get("ultimo_token_flow") or orden.get("flow_token")
+        if not token:
+            continue
+        try:
+            resultado = procesar_confirmacion_flow(
+                raw_token=token,
+                flow_client=flow_client,
+                origen="reconciliacion",
+                ahora=ahora_utc,
+            )
+            reconciliadas.append(resultado)
+        except (FlowConfigurationError, FlowProviderError):
+            # Si la orden ya había sido verificada con Flow (`flow_status == 2`) y quedó
+            # interrumpida en `en_proceso`, podemos cerrar localmente la activación pendiente.
+            if orden.get("flow_status") == 2 and orden.get("activacion_estado") == "en_proceso":
+                try:
+                    estado_local, _, vigencia_local = _ejecutar_activacion_recuperable(
+                        orden,
+                        flow_orden=orden.get("flow_orden"),
+                        ahora_utc=ahora_utc,
+                    )
+                    reconciliadas.append(
+                        {
+                            "ok": True,
+                            "orden_comercio": orden["orden_comercio"],
+                            "estado": estado_local,
+                            "suscripcion_activa_hasta": (
+                                vigencia_local.isoformat() if vigencia_local else None
+                            ),
+                        }
+                    )
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return reconciliadas
 
 
 def construir_url_retorno_frontend(
@@ -370,18 +514,31 @@ def construir_url_retorno_frontend(
     return f"{base}/?{urlencode(query)}"
 
 
-def obtener_detalle_orden_usuario(usuario_actual, orden_comercio):
+def obtener_detalle_orden_usuario(usuario_actual, orden_comercio, flow_client=None):
     if not isinstance(orden_comercio, str) or not ORDEN_COMERCIO_PATTERN.fullmatch(
         orden_comercio.strip()
     ):
         raise OrdenNoEncontradaError("Orden no encontrada.")
 
-    orden = repository.buscar_orden_por_comercio(orden_comercio.strip())
+    codigo_limpio = orden_comercio.strip()
+    orden = repository.buscar_orden_por_comercio(codigo_limpio)
     if not orden:
         raise OrdenNoEncontradaError("Orden no encontrada.")
 
     if orden.get("usuario_id") != usuario_actual["_id"]:
         raise AccesoOrdenDenegadoError("No tienes permiso para consultar esta orden.")
+
+    if flow_client is not None and (
+        orden.get("requiere_reconciliacion")
+        or orden.get("activacion_estado") == "en_proceso"
+    ):
+        reconciliar_ordenes_pendientes(
+            flow_client=flow_client,
+            usuario_id=usuario_actual["_id"],
+            orden_comercio=codigo_limpio,
+            limite=1,
+        )
+        orden = repository.buscar_orden_por_comercio(codigo_limpio) or orden
 
     usuario_fresco = obtener_usuario_por_id(usuario_actual["_id"]) or usuario_actual
     estado_suscripcion = obtener_estado_suscripcion(usuario_fresco)
@@ -398,6 +555,7 @@ def obtener_detalle_orden_usuario(usuario_actual, orden_comercio):
         "duracion_dias": orden.get("duracion_dias", 30),
         "estado": orden["estado"],
         "activacion_estado": orden.get("activacion_estado", "pendiente"),
+        "requiere_reconciliacion": bool(orden.get("requiere_reconciliacion", False)),
         "flow_orden": orden.get("flow_orden"),
         "fecha_creacion": fecha_creacion.isoformat() if fecha_creacion else None,
         "fecha_pago": fecha_pago.isoformat() if fecha_pago else None,

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import jwt
+import requests
 from bson import ObjectId
 from flask import Flask
 from pymongo.errors import DuplicateKeyError
@@ -16,10 +17,12 @@ os.environ["SECRET_KEY"] = "test-only-key-with-more-than-32-bytes"
 os.environ["APP_ENV"] = "test"
 
 import app as application
-from backend.app.config import configure_flow_settings
+from backend.app.config import MAX_FLOW_HTTP_TIMEOUT_SECONDS, configure_flow_settings
 from backend.app.integrations.flow_client import (
     FlowClient,
+    FlowConfigurationError,
     FlowProviderError,
+    FlowTimeoutError,
     sign_flow_params,
     verify_flow_signature,
 )
@@ -41,6 +44,8 @@ class InMemoryCollection:
             self.unique_fields.add((keys, bool(kwargs.get("sparse", False))))
 
     def _matches(self, doc, query):
+        if not query:
+            return True
         for key, condition in query.items():
             if key == "$or":
                 if not any(self._matches(doc, subq) for subq in condition):
@@ -107,6 +112,16 @@ class InMemoryCollection:
                     arr.append(copy.deepcopy(v))
                 target[k] = arr
 
+    def find(self, query=None, limit=0):
+        results = [
+            copy.deepcopy(doc)
+            for doc in self.docs
+            if self._matches(doc, query or {})
+        ]
+        if limit and limit > 0:
+            return results[:limit]
+        return results
+
     def find_one(self, query):
         for doc in self.docs:
             if self._matches(doc, query):
@@ -158,6 +173,7 @@ class FlowPagosTests(unittest.TestCase):
             FLOW_API_URL="https://sandbox.flow.cl/api",
             FLOW_API_KEY="flow-sandbox-api-key",
             FLOW_SECRET_KEY="flow-sandbox-secret-key",
+            FLOW_HTTP_TIMEOUT_SECONDS=8.0,
             FLOW_CONFIRMATION_URL="https://hub.example/api/pagos/flow/confirmacion",
             FLOW_RETURN_URL="https://hub.example/api/pagos/flow/retorno",
             FRONTEND_PUBLIC_URL="http://localhost:5173",
@@ -283,7 +299,7 @@ class FlowPagosTests(unittest.TestCase):
             verify_flow_signature(sent_post_data, sent_post_data["s"], "test-secret")
         )
 
-        status = flow.get_status("TOK_SANDBOX_123")
+        status = flow.get_payment_status("TOK_SANDBOX_123")
         self.assertEqual(status["status"], 2)
         sent_get_params = fake_session.get.call_args.kwargs["params"]
         self.assertTrue(
@@ -328,7 +344,6 @@ class FlowPagosTests(unittest.TestCase):
             "FRONTEND_PUBLIC_URL": "https://hub.aventureros.cl",
         }
 
-        # Falla si falta cualquiera de las 3 URLs públicas en producción
         for clave in ("FLOW_CONFIRMATION_URL", "FLOW_RETURN_URL", "FRONTEND_PUBLIC_URL"):
             env_incompleto = dict(base_prod)
             env_incompleto.pop(clave)
@@ -336,7 +351,6 @@ class FlowPagosTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     configure_flow_settings(dummy_app, environ=env_incompleto)
 
-        # Falla con HTTP o con hosts locales/loopback
         urls_prohibidas = [
             "http://hub.aventureros.cl/ruta",
             "https://localhost:5000/ruta",
@@ -355,6 +369,40 @@ class FlowPagosTests(unittest.TestCase):
         configure_flow_settings(dummy_app, environ=base_prod)
         self.assertEqual(dummy_app.config["FLOW_ENV"], "production")
         self.assertEqual(dummy_app.config["FLOW_API_URL"], "https://www.flow.cl/api")
+
+    def test_config_production_rechaza_ips_privadas_literales_y_exige_is_global(self):
+        dummy_app = Flask("test_config_private_ips")
+        base_prod = {
+            "FLOW_ENV": "production",
+            "FLOW_API_URL": "https://www.flow.cl/api",
+            "FLOW_CONFIRMATION_URL": "https://hub.aventureros.cl/api/pagos/flow/confirmacion",
+            "FLOW_RETURN_URL": "https://hub.aventureros.cl/api/pagos/flow/retorno",
+            "FRONTEND_PUBLIC_URL": "https://hub.aventureros.cl",
+        }
+
+        ips_no_globales = [
+            "https://192.168.1.10/api/pagos/flow/confirmacion",
+            "https://10.0.0.5/api/pagos/flow/confirmacion",
+            "https://172.16.12.4/api/pagos/flow/confirmacion",
+            "https://169.254.169.254/api/pagos/flow/confirmacion",
+            "https://100.64.0.1/api/pagos/flow/confirmacion",
+        ]
+        for clave in ("FLOW_CONFIRMATION_URL", "FLOW_RETURN_URL", "FRONTEND_PUBLIC_URL"):
+            for url_privada in ips_no_globales:
+                env_invalido = dict(base_prod)
+                env_invalido[clave] = url_privada
+                with self.subTest(setting=clave, url=url_privada):
+                    with self.assertRaises(RuntimeError):
+                        configure_flow_settings(dummy_app, environ=env_invalido)
+
+        # Una IP pública enrutable globalmente sí es aceptada si usa HTTPS
+        env_ip_global = dict(base_prod)
+        env_ip_global["FLOW_CONFIRMATION_URL"] = "https://190.196.10.20/api/pagos/flow/confirmacion"
+        configure_flow_settings(dummy_app, environ=env_ip_global)
+        self.assertEqual(
+            dummy_app.config["FLOW_CONFIRMATION_URL"],
+            "https://190.196.10.20/api/pagos/flow/confirmacion",
+        )
 
     def test_flow_client_create_payment_rechaza_url_maliciosa_o_http(self):
         for url_maliciosa in (
@@ -399,6 +447,186 @@ class FlowPagosTests(unittest.TestCase):
                     headers=self.auth_headers(),
                 )
                 self.assertEqual(res.status_code, 502)
+
+    def test_flow_client_timeout_acotado_bajo_15s_y_manejo_resiliente_en_confirmacion(self):
+        # 1) Verifica cota estricta <= 10s (bajo los 15s de Flow)
+        cliente_default = FlowClient(api_key="k", secret_key="s")
+        self.assertLessEqual(
+            cliente_default.total_timeout_seconds, MAX_FLOW_HTTP_TIMEOUT_SECONDS
+        )
+        self.assertLess(cliente_default.total_timeout_seconds, 15.0)
+
+        with self.assertRaises(FlowConfigurationError):
+            FlowClient(api_key="k", secret_key="s", timeout=15.0)
+        with self.assertRaises(FlowConfigurationError):
+            FlowClient(api_key="k", secret_key="s", timeout=(6.0, 6.0))
+
+        dummy_app = Flask("test_timeout_cfg")
+        with self.assertRaises(RuntimeError):
+            configure_flow_settings(
+                dummy_app, environ={"FLOW_HTTP_TIMEOUT_SECONDS": "15"}
+            )
+
+        # 2) Simula timeout transitorio de red en `get_payment_status` durante el webhook
+        fake_session = MagicMock()
+        create_ok = MagicMock(status_code=200)
+        create_ok.json.return_value = {
+            "url": "https://sandbox.flow.cl/app/web/pay.php",
+            "token": "TOK_TIMEOUT_WEBHOOK",
+            "flowOrder": 445566,
+        }
+        fake_session.post.return_value = create_ok
+        fake_session.get.side_effect = requests.Timeout("Flow tardó demasiado")
+
+        flow_real = FlowClient(
+            api_key="flow-sandbox-api-key",
+            secret_key="flow-sandbox-secret-key",
+            api_url="https://sandbox.flow.cl/api",
+            flow_env="sandbox",
+            session=fake_session,
+        )
+        with self.assertRaises(FlowTimeoutError):
+            flow_real.get_payment_status("TOK_TIMEOUT_WEBHOOK")
+
+        with (
+            patch.object(application.mongo, "db", self.fake_db),
+            patch("backend.app.pagos.routes._get_flow_client", return_value=flow_real),
+        ):
+            inicio = self.client.post(
+                "/api/pagos/flow/iniciar",
+                json={},
+                headers=self.auth_headers(),
+            )
+            self.assertEqual(inicio.status_code, 201)
+            orden_comercio = inicio.json["orden_comercio"]
+
+            # El webhook responde HTTP 200 controlado y persiste `requiere_reconciliacion=True`
+            conf_timeout = self.client.post(
+                "/api/pagos/flow/confirmacion",
+                data={"token": "TOK_TIMEOUT_WEBHOOK"},
+            )
+            self.assertEqual(conf_timeout.status_code, 200)
+            self.assertTrue(conf_timeout.json["ok"])
+            self.assertTrue(conf_timeout.json["reconciliacion_pendiente"])
+
+            orden_pendiente = self.fake_db.ordenes.find_one(
+                {"orden_comercio": orden_comercio}
+            )
+            self.assertTrue(orden_pendiente["requiere_reconciliacion"])
+            self.assertEqual(
+                orden_pendiente["ultimo_token_flow"], "TOK_TIMEOUT_WEBHOOK"
+            )
+            self.assertIsNotNone(orden_pendiente["confirmacion_recibida_en"])
+
+            # Cuando Flow vuelve a responder normalmente, consultar suscripción/orden reconcilia automáticamente
+            status_ok = MagicMock(status_code=200)
+            status_ok.json.return_value = {
+                "flowOrder": 445566,
+                "commerceOrder": orden_comercio,
+                "status": 2,
+                "amount": 1490,
+                "currency": "CLP",
+            }
+            fake_session.get.side_effect = None
+            fake_session.get.return_value = status_ok
+
+            sub_res = self.client.get(
+                "/api/perfil/suscripcion",
+                headers=self.auth_headers(),
+            )
+            self.assertEqual(sub_res.status_code, 200)
+            self.assertTrue(sub_res.json["es_suscriptor_activo"])
+
+            orden_reconciliada = self.fake_db.ordenes.find_one(
+                {"orden_comercio": orden_comercio}
+            )
+            self.assertEqual(orden_reconciliada["estado"], "pagada")
+            self.assertEqual(orden_reconciliada["activacion_estado"], "aplicada")
+            self.assertFalse(orden_reconciliada["requiere_reconciliacion"])
+
+    def test_confirmacion_concurrente_en_proceso_responde_200_y_reconcilia_automaticamente(self):
+        mock_flow = MagicMock()
+        mock_flow.create_payment.return_value = {
+            "url": "https://sandbox.flow.cl/app/web/pay.php",
+            "token": "TOK_CONCURRENTE_200",
+            "flow_order": 909090,
+            "redirect_url": "https://sandbox.flow.cl/app/web/pay.php?token=TOK_CONCURRENTE_200",
+        }
+
+        with (
+            patch.object(application.mongo, "db", self.fake_db),
+            patch("backend.app.pagos.routes._get_flow_client", return_value=mock_flow),
+        ):
+            inicio = self.client.post(
+                "/api/pagos/flow/iniciar",
+                json={},
+                headers=self.auth_headers(),
+            )
+            orden_comercio = inicio.json["orden_comercio"]
+            doc_orden = self.fake_db.ordenes.find_one({"orden_comercio": orden_comercio})
+
+            mock_flow.get_status.return_value = {
+                "flowOrder": 909090,
+                "commerceOrder": orden_comercio,
+                "status": 2,
+                "amount": 1490,
+                "currency": "CLP",
+            }
+
+            # Simulamos que `/retorno` u otro worker tomó `en_proceso` hace 2 segundos (bloqueo vigente)
+            self.fake_db.ordenes.update_one(
+                {"_id": doc_orden["_id"]},
+                {
+                    "$set": {
+                        "activacion_estado": "en_proceso",
+                        "activacion_intento_en": datetime.now(timezone.utc),
+                        "suscripcion_aplicada": False,
+                    }
+                },
+            )
+
+            # `urlConfirmation` concurrente NUNCA devuelve 409; responde HTTP 200 idempotente
+            conf_concurrente = self.client.post(
+                "/api/pagos/flow/confirmacion",
+                data={"token": "TOK_CONCURRENTE_200"},
+            )
+            self.assertEqual(conf_concurrente.status_code, 200)
+            self.assertTrue(conf_concurrente.json["ok"])
+            self.assertEqual(conf_concurrente.json["estado"], "en_proceso")
+            self.assertTrue(conf_concurrente.json["idempotente"])
+
+            # `/retorno` concurrente tampoco falla con 409; redirige con 303 See Other
+            retorno_concurrente = self.client.post(
+                "/api/pagos/flow/retorno",
+                data={"token": "TOK_CONCURRENTE_200"},
+            )
+            self.assertEqual(retorno_concurrente.status_code, 303)
+
+            orden_guardada = self.fake_db.ordenes.find_one({"_id": doc_orden["_id"]})
+            self.assertTrue(orden_guardada["requiere_reconciliacion"])
+            self.assertEqual(orden_guardada["ultimo_token_flow"], "TOK_CONCURRENTE_200")
+            self.assertIsNotNone(orden_guardada["confirmacion_recibida_en"])
+
+            # Si aquel primer worker murió sin terminar y el bloqueo vence, la consulta recupera la orden
+            self.fake_db.ordenes.update_one(
+                {"_id": doc_orden["_id"]},
+                {
+                    "$set": {
+                        "activacion_intento_en": datetime.now(timezone.utc)
+                        - timedelta(seconds=120),
+                    }
+                },
+            )
+
+            detalle_res = self.client.get(
+                f"/api/ordenes/{orden_comercio}",
+                headers=self.auth_headers(),
+            )
+            self.assertEqual(detalle_res.status_code, 200)
+            self.assertEqual(detalle_res.json["orden"]["estado"], "pagada")
+            self.assertEqual(detalle_res.json["orden"]["activacion_estado"], "aplicada")
+            self.assertFalse(detalle_res.json["orden"]["requiere_reconciliacion"])
+            self.assertTrue(detalle_res.json["orden"]["es_suscriptor_activo"])
 
     def test_calcular_nueva_vigencia_nueva_vencida_y_renovacion_anticipada(self):
         ahora = datetime(2026, 11, 26, 12, 0, 0, tzinfo=timezone.utc)
@@ -487,6 +715,7 @@ class FlowPagosTests(unittest.TestCase):
                 data={"token": "FLOW_TOKEN_UNICO_001"},
             )
             self.assertEqual(conf_1.status_code, 200)
+            self.assertTrue(conf_1.json["ok"])
             self.assertEqual(conf_1.json["estado"], "pagada")
             self.assertFalse(conf_1.json["idempotente"])
             vigencia_inicial = conf_1.json["suscripcion_activa_hasta"]
@@ -495,6 +724,7 @@ class FlowPagosTests(unittest.TestCase):
             orden_aplicada = self.fake_db.ordenes.find_one({"orden_comercio": orden_comercio})
             self.assertEqual(orden_aplicada["activacion_estado"], "aplicada")
             self.assertTrue(orden_aplicada["suscripcion_aplicada"])
+            self.assertFalse(orden_aplicada["requiere_reconciliacion"])
 
             conf_2 = self.client.post(
                 "/api/pagos/flow/confirmacion",
@@ -556,7 +786,6 @@ class FlowPagosTests(unittest.TestCase):
             patch.object(application.mongo, "db", self.fake_db),
             patch("backend.app.pagos.routes._get_flow_client", return_value=mock_flow),
         ):
-            # --- Caso A: Falla al actualizar `usuarios`; la orden NO queda con suscripcion_aplicada=True ---
             inicio_a = self.client.post(
                 "/api/pagos/flow/iniciar",
                 json={},
@@ -584,10 +813,10 @@ class FlowPagosTests(unittest.TestCase):
             orden_a_intermedia = self.fake_db.ordenes.find_one({"orden_comercio": orden_a})
             self.assertEqual(orden_a_intermedia["activacion_estado"], "en_proceso")
             self.assertFalse(orden_a_intermedia["suscripcion_aplicada"])
+            self.assertTrue(orden_a_intermedia["requiere_reconciliacion"])
             self.assertIsNotNone(orden_a_intermedia["vigencia_otorgada_hasta"])
             vigencia_fijada_a = orden_a_intermedia["vigencia_otorgada_hasta"]
 
-            # El reintento del webhook retoma `en_proceso`, aplica la vigencia exacta y cierra en `aplicada`
             reintento_a = self.client.post(
                 "/api/pagos/flow/confirmacion",
                 data={"token": "TOK_INTERRUPCION_1"},
@@ -598,10 +827,10 @@ class FlowPagosTests(unittest.TestCase):
             orden_a_final = self.fake_db.ordenes.find_one({"orden_comercio": orden_a})
             self.assertEqual(orden_a_final["activacion_estado"], "aplicada")
             self.assertTrue(orden_a_final["suscripcion_aplicada"])
+            self.assertFalse(orden_a_final["requiere_reconciliacion"])
             usuario_tras_a = self.fake_db.usuarios.find_one({"_id": self.user_id})
             self.assertEqual(usuario_tras_a["suscripcion_activa_hasta"], vigencia_fijada_a)
 
-            # --- Caso B: Proceso muere DESPUÉS de actualizar `usuarios` y ANTES de marcar `aplicada` ---
             inicio_b = self.client.post(
                 "/api/pagos/flow/iniciar",
                 json={},
@@ -611,8 +840,6 @@ class FlowPagosTests(unittest.TestCase):
             doc_orden_b = self.fake_db.ordenes.find_one({"orden_comercio": orden_b})
             vigencia_objetivo_b = vigencia_fijada_a + timedelta(days=30)
 
-            # Simulamos que el intento anterior ya sumó los 30 días en `usuarios`, dejó bloqueo expirado
-            # en `en_proceso` y se interrumpió antes de `finalizar_activacion_orden`
             self.fake_db.ordenes.update_one(
                 {"_id": doc_orden_b["_id"]},
                 {
@@ -652,7 +879,6 @@ class FlowPagosTests(unittest.TestCase):
             self.assertEqual(orden_b_final["activacion_estado"], "aplicada")
             self.assertTrue(orden_b_final["suscripcion_aplicada"])
 
-            # Verifica que NO se sumaron otros 30 días adicionales al recuperar la orden
             usuario_tras_b = self.fake_db.usuarios.find_one({"_id": self.user_id})
             self.assertEqual(
                 usuario_tras_b["suscripcion_activa_hasta"],

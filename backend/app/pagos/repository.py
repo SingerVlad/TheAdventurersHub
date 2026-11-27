@@ -16,6 +16,9 @@ def asegurar_indices_pagos():
     mongo.db.ordenes.create_index("orden_comercio", unique=True)
     mongo.db.ordenes.create_index("flow_token", unique=True, sparse=True)
     mongo.db.ordenes.create_index([("usuario_id", 1), ("fecha_creacion", -1)])
+    mongo.db.ordenes.create_index(
+        [("requiere_reconciliacion", 1), ("activacion_estado", 1)]
+    )
     mongo.db.transacciones_pago.create_index([("orden_id", 1), ("fecha_evento", -1)])
     _pagos_indices_listos = True
 
@@ -33,6 +36,7 @@ def guardar_datos_flow_en_orden(orden_id, flow_token, flow_orden, fecha_actualiz
         {
             "$set": {
                 "flow_token": flow_token,
+                "ultimo_token_flow": flow_token,
                 "flow_orden": flow_orden,
                 "fecha_actualizacion": fecha_actualizacion,
             }
@@ -51,6 +55,7 @@ def marcar_orden_fallida(orden_id, fecha_actualizacion):
         {
             "$set": {
                 "estado": "fallida",
+                "requiere_reconciliacion": False,
                 "fecha_actualizacion": fecha_actualizacion,
             }
         },
@@ -58,11 +63,83 @@ def marcar_orden_fallida(orden_id, fecha_actualizacion):
 
 
 def buscar_orden_por_token(flow_token):
-    return mongo.db.ordenes.find_one({"flow_token": flow_token})
+    orden = mongo.db.ordenes.find_one({"flow_token": flow_token})
+    if orden is not None:
+        return orden
+    return mongo.db.ordenes.find_one({"ultimo_token_flow": flow_token})
 
 
 def buscar_orden_por_comercio(orden_comercio):
     return mongo.db.ordenes.find_one({"orden_comercio": orden_comercio})
+
+
+def persistir_recepcion_confirmacion(orden_id, token, ahora):
+    """
+    Registra de forma duradera en la orden la llegada de una notificación/token de Flow
+    antes de reclamar o ejecutar la activación, marcando `requiere_reconciliacion=True`
+    únicamente mientras la orden no esté ya `"aplicada"`.
+    """
+    actualizada = mongo.db.ordenes.find_one_and_update(
+        {
+            "_id": orden_id,
+            "suscripcion_aplicada": {"$ne": True},
+            "activacion_estado": {"$ne": "aplicada"},
+        },
+        {
+            "$set": {
+                "confirmacion_recibida_en": ahora,
+                "ultimo_token_flow": token,
+                "requiere_reconciliacion": True,
+                "fecha_actualizacion": ahora,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if actualizada is not None:
+        return actualizada
+    return mongo.db.ordenes.find_one({"_id": orden_id})
+
+
+def buscar_ordenes_reconciliables(
+    usuario_id=None,
+    orden_comercio=None,
+    ahora=None,
+    lock_ttl_seconds=ACTIVACION_LOCK_TTL_SECONDS,
+    limite=5,
+):
+    """
+    Obtiene órdenes con `requiere_reconciliacion=True` o bloqueos `"en_proceso"` vencidos
+    para completar automáticamente su activación cuando sea seguro hacerlo.
+    """
+    coleccion = getattr(mongo.db, "ordenes", None)
+    if coleccion is None or not hasattr(coleccion, "find"):
+        return []
+
+    expiracion_bloqueo = ahora - timedelta(seconds=lock_ttl_seconds)
+    filtro = {
+        "suscripcion_aplicada": {"$ne": True},
+        "activacion_estado": {"$ne": "aplicada"},
+        "$or": [
+            {
+                "requiere_reconciliacion": True,
+                "activacion_estado": {"$in": [None, "pendiente"]},
+            },
+            {
+                "activacion_estado": "en_proceso",
+                "activacion_intento_en": None,
+            },
+            {
+                "activacion_estado": "en_proceso",
+                "activacion_intento_en": {"$lte": expiracion_bloqueo},
+            },
+        ],
+    }
+    if usuario_id is not None:
+        filtro["usuario_id"] = usuario_id
+    if orden_comercio is not None:
+        filtro["orden_comercio"] = orden_comercio
+
+    return list(coleccion.find(filtro, limit=limite))
 
 
 def adquirir_orden_para_activacion(
@@ -94,6 +171,7 @@ def adquirir_orden_para_activacion(
             "$set": {
                 "activacion_estado": "en_proceso",
                 "activacion_intento_en": ahora,
+                "requiere_reconciliacion": True,
                 "flow_orden": flow_orden,
                 "flow_status": 2,
                 "fecha_actualizacion": ahora,
@@ -135,7 +213,10 @@ def fijar_vigencia_objetivo_en_orden(
 
 
 def liberar_intento_activacion_en_proceso(orden_id, fecha_actualizacion):
-    """Mantiene `activacion_estado="en_proceso"` pero libera `activacion_intento_en` ante un fallo recuperable."""
+    """
+    Mantiene `activacion_estado="en_proceso"` y `requiere_reconciliacion=True`,
+    liberando `activacion_intento_en` ante un fallo recuperable.
+    """
     mongo.db.ordenes.update_one(
         {
             "_id": orden_id,
@@ -145,6 +226,7 @@ def liberar_intento_activacion_en_proceso(orden_id, fecha_actualizacion):
         {
             "$set": {
                 "activacion_intento_en": None,
+                "requiere_reconciliacion": True,
                 "fecha_actualizacion": fecha_actualizacion,
             }
         },
@@ -158,7 +240,7 @@ def finalizar_activacion_orden(
     fecha_pago,
     fecha_actualizacion,
 ):
-    """Marca la orden como pagada y `suscripcion_aplicada=True` únicamente después de actualizar `usuarios`."""
+    """Marca la orden como pagada, `suscripcion_aplicada=True` y limpia `requiere_reconciliacion`."""
     return mongo.db.ordenes.find_one_and_update(
         {"_id": orden_id},
         {
@@ -166,6 +248,7 @@ def finalizar_activacion_orden(
                 "estado": "pagada",
                 "activacion_estado": "aplicada",
                 "suscripcion_aplicada": True,
+                "requiere_reconciliacion": False,
                 "vigencia_otorgada_hasta": vigencia_hasta,
                 "flow_orden": flow_orden,
                 "flow_status": 2,
@@ -180,6 +263,7 @@ def finalizar_activacion_orden(
 def actualizar_estado_no_pagado(
     orden_id, nuevo_estado, flow_status, flow_orden, fecha_actualizacion
 ):
+    requiere_reconciliacion = nuevo_estado == "pendiente"
     return mongo.db.ordenes.find_one_and_update(
         {
             "_id": orden_id,
@@ -192,6 +276,7 @@ def actualizar_estado_no_pagado(
                 "estado": nuevo_estado,
                 "flow_status": flow_status,
                 "flow_orden": flow_orden,
+                "requiere_reconciliacion": requiere_reconciliacion,
                 "fecha_actualizacion": fecha_actualizacion,
             }
         },

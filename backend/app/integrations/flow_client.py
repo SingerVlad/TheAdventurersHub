@@ -4,7 +4,14 @@ from urllib.parse import urlencode, urlparse
 
 import requests
 
-from backend.app.config import DEFAULT_FLOW_API_URLS, OFFICIAL_FLOW_HOSTS
+from backend.app.config import (
+    DEFAULT_FLOW_API_URLS,
+    DEFAULT_FLOW_HTTP_TIMEOUT_SECONDS,
+    MAX_FLOW_HTTP_TIMEOUT_SECONDS,
+    OFFICIAL_FLOW_HOSTS,
+)
+
+DEFAULT_FLOW_TIMEOUT_TUPLE = (3.0, 5.0)
 
 
 class FlowError(Exception):
@@ -17,6 +24,40 @@ class FlowConfigurationError(FlowError):
 
 class FlowProviderError(FlowError):
     """Error de comunicación o respuesta inválida desde Flow."""
+
+
+class FlowTimeoutError(FlowProviderError):
+    """Tiempo de espera agotado al comunicarse con Flow."""
+
+
+def _normalize_bounded_timeout(timeout):
+    """
+    Garantiza que el timeout HTTP hacia Flow nunca supere `MAX_FLOW_HTTP_TIMEOUT_SECONDS` (10s),
+    dejando margen suficiente bajo el límite de 15 segundos exigido por el webhook de Flow.
+    """
+    if timeout is None:
+        return DEFAULT_FLOW_TIMEOUT_TUPLE
+
+    if isinstance(timeout, tuple) and len(timeout) == 2:
+        connect_t, read_t = float(timeout[0]), float(timeout[1])
+        total = connect_t + read_t
+        if connect_t <= 0 or read_t <= 0 or total > MAX_FLOW_HTTP_TIMEOUT_SECONDS:
+            raise FlowConfigurationError(
+                f"El timeout total de Flow debe ser positivo y menor o igual a {MAX_FLOW_HTTP_TIMEOUT_SECONDS}s."
+            )
+        return (connect_t, read_t)
+
+    if isinstance(timeout, (int, float)):
+        total = float(timeout)
+        if not (0 < total <= MAX_FLOW_HTTP_TIMEOUT_SECONDS):
+            raise FlowConfigurationError(
+                f"El timeout de Flow debe ser positivo y menor o igual a {MAX_FLOW_HTTP_TIMEOUT_SECONDS}s."
+            )
+        connect_t = round(min(3.0, total * 0.4), 2)
+        read_t = round(max(0.1, total - connect_t), 2)
+        return (connect_t, read_t)
+
+    raise FlowConfigurationError("Formato de timeout inválido para FlowClient.")
 
 
 def sign_flow_params(params, secret_key):
@@ -78,7 +119,7 @@ class FlowClient:
         secret_key,
         api_url=None,
         flow_env="sandbox",
-        timeout=20,
+        timeout=DEFAULT_FLOW_TIMEOUT_TUPLE,
         session=None,
     ):
         self.flow_env = (flow_env or "sandbox").strip().lower()
@@ -89,17 +130,27 @@ class FlowClient:
         self.api_key = (api_key or "").strip()
         self.secret_key = (secret_key or "").strip()
         self.api_url = (api_url or default_url).strip().rstrip("/")
-        self.timeout = timeout
+        self.timeout = _normalize_bounded_timeout(timeout)
         self._http = session or requests
+
+    @property
+    def total_timeout_seconds(self):
+        if isinstance(self.timeout, tuple):
+            return sum(self.timeout)
+        return float(self.timeout)
 
     @classmethod
     def from_app_config(cls, config):
         flow_env = config.get("FLOW_ENV", "sandbox")
+        configured_timeout = config.get(
+            "FLOW_HTTP_TIMEOUT_SECONDS", DEFAULT_FLOW_HTTP_TIMEOUT_SECONDS
+        )
         return cls(
             api_key=config.get("FLOW_API_KEY", ""),
             secret_key=config.get("FLOW_SECRET_KEY", ""),
             api_url=config.get("FLOW_API_URL"),
             flow_env=flow_env,
+            timeout=configured_timeout,
         )
 
     def _ensure_configured(self):
@@ -143,6 +194,10 @@ class FlowClient:
                 data=params,
                 timeout=self.timeout,
             )
+        except requests.Timeout as error:
+            raise FlowTimeoutError(
+                "Tiempo de espera agotado al crear el pago en Flow."
+            ) from error
         except requests.RequestException as error:
             raise FlowProviderError("No se pudo conectar con la pasarela Flow.") from error
 
@@ -188,6 +243,10 @@ class FlowClient:
                 params=params,
                 timeout=self.timeout,
             )
+        except requests.Timeout as error:
+            raise FlowTimeoutError(
+                "Tiempo de espera agotado al consultar el estado del pago en Flow."
+            ) from error
         except requests.RequestException as error:
             raise FlowProviderError("No se pudo consultar el estado en Flow.") from error
 
@@ -205,3 +264,7 @@ class FlowClient:
             raise FlowProviderError("Respuesta incompleta desde Flow en payment/getStatus.")
 
         return data
+
+    def get_payment_status(self, token):
+        """Alias explícito usado en callbacks síncronos de confirmación."""
+        return self.get_status(token)
