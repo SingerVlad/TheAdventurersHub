@@ -17,7 +17,7 @@ from flask_pymongo import PyMongo
 from bson.objectid import ObjectId
 from bson.errors import InvalidId
 from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 import time
 import requests
+import click
 
 load_dotenv()
 
@@ -355,6 +356,47 @@ def obtener_perfil(usuario_actual):
         }
     }), 200
 
+def preparar_indices():
+    """Crea el índice de invitaciones antes de iniciar el servidor."""
+    campanas = mongo.db.campanas
+    try:
+        indices = campanas.index_information()
+        if any(
+            indice.get("key") == [("codigo_invitacion", 1)]
+            and indice.get("unique")
+            and not indice.get("sparse")
+            and not indice.get("partialFilterExpression")
+            for indice in indices.values()
+        ):
+            return
+
+        duplicados = campanas.aggregate([
+            {"$group": {"_id": "$codigo_invitacion", "cantidad": {"$sum": 1}}},
+            {"$match": {"cantidad": {"$gt": 1}}},
+            {"$limit": 1},
+        ])
+        if next(duplicados, None) is not None:
+            raise click.ClickException(
+                "Hay códigos de invitación duplicados o varias campañas sin código. "
+                "Corrige esos registros antes de iniciar el servidor."
+            )
+        campanas.create_index("codigo_invitacion", unique=True)
+    except DuplicateKeyError as error:
+        raise click.ClickException(
+            "MongoDB encontró códigos de invitación duplicados al crear el índice."
+        ) from error
+    except PyMongoError as error:
+        raise click.ClickException(
+            "No se pudo preparar el índice de invitaciones. Revisa la conexión y los índices de MongoDB."
+        ) from error
+
+
+@app.cli.command("preparar-indices")
+def preparar_indices_cli():
+    """Prepara los índices requeridos por campañas."""
+    preparar_indices()
+
+
 @app.route('/api/campanas', methods=['POST'])
 @token_required
 @rate_limit("crear-campana", limit=10, window_seconds=86400, authenticated=True)
@@ -370,19 +412,28 @@ def crear_campana(usuario_actual):
     if not isinstance(descripcion, str) or len(descripcion) > 2000:
         return jsonify({"error": "La descripción no puede superar 2000 caracteres"}), 400
 
+    campanas = mongo.db.campanas
+
     nueva_campana = {
         "nombre": nombre.strip(),
         "descripcion": descripcion.strip(),
-        "codigo_invitacion": "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8)),
-        "dm_id": usuario_actual['_id'],
-        "jugadores": [] # Lista de IDs de jugadores unidos
+        "dm_id": usuario_actual["_id"],
+        "jugadores": [],
     }
-    resultado = mongo.db.campanas.insert_one(nueva_campana)
-    return jsonify({
-        "status": "success", 
-        "id": str(resultado.inserted_id),
-        "codigo": nueva_campana['codigo_invitacion']
-    }), 201
+    for _ in range(3):
+        codigo = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+        nueva_campana["codigo_invitacion"] = codigo
+        try:
+            resultado = campanas.insert_one(nueva_campana.copy())
+        except DuplicateKeyError:
+            continue
+        return jsonify({
+            "status": "success",
+            "id": str(resultado.inserted_id),
+            "codigo": codigo,
+        }), 201
+
+    return jsonify({"error": "No se pudo generar un código de invitación. Intenta de nuevo."}), 503
 
 
 
@@ -957,6 +1008,11 @@ def obtener_detalle_campana(usuario_actual, campana_id):
         return jsonify({"error": "No se pudo obtener la campaña"}), 500
 
 if __name__ == '__main__':
+    try:
+        preparar_indices()
+    except click.ClickException as error:
+        error.show()
+        raise SystemExit(error.exit_code) from None
     app.run(
         debug=False,
         host=os.getenv("APP_HOST", "127.0.0.1"),
