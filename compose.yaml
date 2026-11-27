@@ -43,6 +43,13 @@ services:
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       HUGGINGFACE_API_KEY: ${HUGGINGFACE_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      FLOW_ENV: ${FLOW_ENV:-sandbox}
+      FLOW_API_URL: ${FLOW_API_URL:-https://sandbox.flow.cl/api}
+      FLOW_API_KEY: ${FLOW_API_KEY:-}
+      FLOW_SECRET_KEY: ${FLOW_SECRET_KEY:-}
+      FLOW_CONFIRMATION_URL: ${FLOW_CONFIRMATION_URL:-http://localhost:8080/api/pagos/flow/confirmacion}
+      FLOW_RETURN_URL: ${FLOW_RETURN_URL:-http://localhost:8080/api/pagos/flow/retorno}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-http://localhost:8080}
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
     volumes:
       - foundry_assets:/data/foundry

@@ -10,13 +10,8 @@ import uuid
 import jwt
 import json
 from datetime import datetime, timedelta, timezone
-from functools import wraps
 from flask import Flask, g, jsonify, request, send_file
 from flask_cors import CORS
-from flask_pymongo import PyMongo
-from bson.objectid import ObjectId
-from bson.errors import InvalidId
-from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.exceptions import HTTPException
@@ -25,6 +20,11 @@ from dotenv import load_dotenv
 
 import time
 import requests
+
+from backend.app.auth.routes import auth_bp
+from backend.app.config import configure_flow_settings
+from backend.app.extensions import mongo, parse_object_id, rate_limit, token_required
+from backend.app.pagos.routes import pagos_bp
 
 load_dotenv()
 
@@ -60,7 +60,7 @@ allowed_origins = [
 CORS(
     app,
     resources={r"/api/*": {"origins": allowed_origins}},
-    methods=["GET", "POST", "DELETE", "OPTIONS"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-CSRF-Token"],
     supports_credentials=True,
 )
@@ -97,8 +97,8 @@ if app.config["APP_ENV"] == "production":
         raise RuntimeError("CORS_ORIGINS debe contener únicamente orígenes HTTPS en producción.")
 FOUNDRY_DATA_PATH = Path(os.getenv("FOUNDRY_DATA_PATH", "./var/foundry/imports")).resolve()
 
-mongo = PyMongo(app)
-_rate_limit_index_ready = False
+configure_flow_settings(app)
+mongo.init_app(app)
 
 try:
     trusted_proxy_count = int(os.getenv("TRUST_PROXY_COUNT", "0"))
@@ -114,99 +114,8 @@ if trusted_proxy_count:
         x_host=trusted_proxy_count,
     )
 
-# GUARDIA DE SEGURIDAD (Decorador JWT)
-# ==========================================
-def token_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-        scheme, separator, token = auth_header.partition(" ")
-        if not separator or scheme.lower() != "bearer" or not token.strip():
-            token = None
-
-        cookie_authenticated = token is None
-        if cookie_authenticated:
-            token = request.cookies.get(app.config["JWT_COOKIE_NAME"])
-
-        if not token:
-            return jsonify({"error": "Acceso denegado"}), 401
-        
-        try:
-            data = jwt.decode(
-                token,
-                app.config["SECRET_KEY"],
-                algorithms=["HS256"],
-                issuer=app.config["JWT_ISSUER"],
-                options={"require": ["exp", "iat", "iss", "usuario_id", "csrf"]},
-            )
-            usuario_id = ObjectId(data["usuario_id"])
-        except (jwt.PyJWTError, InvalidId, KeyError, TypeError, ValueError):
-            return jsonify({"error": "Token inválido"}), 401
-
-        if cookie_authenticated and request.method not in {"GET", "HEAD", "OPTIONS"}:
-            csrf_header = request.headers.get("X-CSRF-Token", "")
-            if not csrf_header or not hmac.compare_digest(str(data["csrf"]), csrf_header):
-                return jsonify({"error": "Validación CSRF fallida"}), 403
-
-        usuario_actual = mongo.db.usuarios.find_one({"_id": usuario_id})
-        if not usuario_actual:
-            return jsonify({"error": "Token inválido"}), 401
-        g.usuario_id = usuario_id
-        g.csrf_token = data["csrf"]
-            
-        return f(usuario_actual, *args, **kwargs)
-    return decorated
-
-
-def rate_limit(scope, limit, window_seconds, authenticated=False):
-    def decorator(f):
-        @wraps(f)
-        def decorated(*args, **kwargs):
-            global _rate_limit_index_ready
-            identity = str(g.get("usuario_id")) if authenticated else (request.remote_addr or "unknown")
-            window = int(time.time() // window_seconds)
-            digest = hmac.new(
-                app.config["SECRET_KEY"].encode("utf-8"),
-                f"{scope}:{identity}:{window}".encode("utf-8"),
-                "sha256",
-            ).hexdigest()
-            now = datetime.now(timezone.utc)
-            try:
-                if not _rate_limit_index_ready:
-                    mongo.db.rate_limits.create_index("expires_at", expireAfterSeconds=0)
-                    _rate_limit_index_ready = True
-                result = mongo.db.rate_limits.find_one_and_update(
-                    {"_id": digest},
-                    {
-                        "$inc": {"count": 1},
-                        "$setOnInsert": {"expires_at": now + timedelta(seconds=window_seconds * 2)},
-                    },
-                    upsert=True,
-                    return_document=ReturnDocument.AFTER,
-                )
-            except DuplicateKeyError:
-                result = mongo.db.rate_limits.find_one_and_update(
-                    {"_id": digest}, {"$inc": {"count": 1}}, return_document=ReturnDocument.AFTER
-                )
-            except Exception:
-                app.logger.exception("No se pudo evaluar el límite de solicitudes")
-                return jsonify({"error": "El servicio no está disponible temporalmente"}), 503
-
-            if result["count"] > limit:
-                retry_after = max(1, window_seconds - int(time.time() % window_seconds))
-                response = jsonify({"error": "Demasiadas solicitudes. Intenta más tarde."})
-                response.status_code = 429
-                response.headers["Retry-After"] = str(retry_after)
-                return response
-            return f(*args, **kwargs)
-        return decorated
-    return decorator
-
-
-def parse_object_id(value):
-    if not isinstance(value, str) or not ObjectId.is_valid(value):
-        return None
-    return ObjectId(value)
+app.register_blueprint(auth_bp)
+app.register_blueprint(pagos_bp)
 
 
 def get_campaign_access(campana_id, usuario_id):
@@ -341,19 +250,6 @@ def cerrar_sesion(usuario_actual):
 
 
 
-
-@app.route('/api/perfil', methods=['GET'])
-@token_required # <--- ¡Aquí está la magia! Solo los que tengan pase entran.
-def obtener_perfil(usuario_actual):
-    return jsonify({
-        "status": "success",
-        "mensaje": f"Hola {usuario_actual['username']}.",
-        "datos_usuario": {
-            "id": str(usuario_actual['_id']),
-            "username": usuario_actual['username'],
-            "fecha_registro": usuario_actual['fecha_registro'].isoformat()
-        }
-    }), 200
 
 @app.route('/api/campanas', methods=['POST'])
 @token_required
